@@ -6,28 +6,39 @@ if (!defined('CIVICRM_SYSTEM')) { return; }
 /**
  * Implements hook_civicrm_alterMailParams().
  *
- * Deze hook wordt door CiviCRM aangeroepen vlak voordat een e-mail 
+ * Deze hook wordt door CiviCRM aangeroepen vlak voordat een e-mail
  * daadwerkelijk via SMTP de deur uit gaat.
  * We gebruiken dit moment om in te grijpen, te tellen, en extensief
  * te loggen per individuele e-mail (zowel toegestaan als geaborteerd).
  */
 function batchreminders_civicrm_alterMailParams(&$params, $context) {
 
-	static $sentCount		= 0;
-	static $totalRemaining	= 0;
+	static $sentCount			= 0;
+	static $totalRemaining		= 0;
+	static $blockedScheduleIds	= [];    // action_schedule_ids waarvan de template validatie faalde
 
-	$batchLimit				= 10;
-	$extdebug 				= 'batchreminders'; // Kanaal voor centrale debug-config; niveau wordt opgezocht in ozk.debug.config.php
+	$batchLimit				= 25;
+	$extdebug 				= 'batchreminders';
+	$templateScriptDir		= '/usr/local/bin/templates';
+	$webteamEmail			= 'webteam@onvergetelijk.nl';
 
 	// Bescherming: Limiteer alleen automatische achtergrondprocessen (cli/cron)
 	if (php_sapi_name() !== 'cli') {
 		return;
 	}
 
-	// 1. START VAN DE RUN (Tel het totaal in de database)
+	// 1. START VAN DE RUN
 	if ($sentCount === 0) {
-		$sql				= "SELECT count(id) FROM civicrm_action_log WHERE action_date_time IS NULL";
-		$totalRemaining		= CRM_Core_DAO::singleValueQuery($sql);
+		// Tel alleen wachtenden voor actieve schedules (deadlock-achtergebleven NULL-entries
+		// voor uitgeschakelde schedules worden zo niet meegeteld).
+		$sql			= "
+			SELECT count(L.id)
+			FROM   civicrm_action_log      L
+			JOIN   civicrm_action_schedule S ON S.id = L.action_schedule_id
+			WHERE  L.action_date_time IS NULL
+			AND    S.is_active        = 1
+		";
+		$totalRemaining	= CRM_Core_DAO::singleValueQuery($sql);
 
 		Civi::log()->info("batchreminders: Start batch-run. Doel: max {$batchLimit} van {$totalRemaining} wachtenden.");
 
@@ -36,45 +47,271 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 			wachthond($extdebug, 1, "### SCHEDULED REMINDER BATCH [START] - DOEL: {$batchLimit} VAN {$totalRemaining} WACHTEND", "[REMINDER]");
 			wachthond($extdebug, 2, "########################################################################");
 		}
+
+		// 1.1 Haal de actieve cluster op en valideer + sync via losse functie
+		$clusterTemplates	= _batchreminders_get_cluster();
+		$startup			= _batchreminders_startup($clusterTemplates, $templateScriptDir);
+		$blockedScheduleIds	= $startup['blocked_ids'];
+
+		if (function_exists('wachthond')) {
+			wachthond($extdebug, 3, 'cluster_templates',    $clusterTemplates);
+			wachthond($extdebug, 3, 'blocked_schedule_ids', $blockedScheduleIds);
+		}
+
+		// 1.2 Alert sturen als er fouten waren
+		if (!empty($startup['errors'])) {
+			_batchreminders_send_alert($startup['errors'], count($startup['ok_ids']), $webteamEmail);
+
+			if (function_exists('wachthond')) {
+				wachthond($extdebug, 1, "### VALIDATIEFOUTEN — " . count($blockedScheduleIds) . " SCHEDULES OVERGESLAGEN", "[GEDEELTELIJK]");
+				wachthond($extdebug, 3, 'validation_errors', $startup['errors']);
+			}
+		}
+
+		// 1.3 Sync template-inhoud naar reminders die de validatie haalden
+		if (!empty($startup['ok_ids'])) {
+			$okIds	= implode(',', array_map('intval', $startup['ok_ids']));
+			CRM_Core_DAO::executeQuery("
+				UPDATE civicrm_action_schedule AS S
+				INNER JOIN civicrm_msg_template AS M ON S.msg_template_id = M.id
+				SET    S.body_html  = M.msg_html,
+				       S.body_text  = M.msg_text,
+				       S.subject    = M.msg_subject
+				WHERE  S.msg_template_id IN ({$okIds})
+				AND    S.body_html != M.msg_html
+			");
+			Civi::log()->info("batchreminders: Template-sync voltooid voor: " . implode(', ', $startup['ok_ids']));
+		}
 	}
 
-	// 2. We verzamelen de nuttige info voor de log per e-mail
-	$contactId				= $params['contact_id']	?? 'onbekend';
-	$toEmail				= $params['toEmail']	?? 'onbekend';
-	$subject				= $params['subject']	?? 'geen onderwerp';
+	// 2. Info voor de log
+	$contactId	= $params['contact_id']	?? 'onbekend';
+	$toEmail	= $params['toEmail']	?? 'onbekend';
+	$subject	= $params['subject']	?? 'geen onderwerp';
 
 	// 3. CHECK: Laten we deze door of breken we af?
-	if ($sentCount >= $batchLimit) {
+	$scheduleId	= (int) ($params['entity_id'] ?? 0);
+	$isBlocked	= in_array($scheduleId, $blockedScheduleIds, TRUE);
+
+	if ($isBlocked || $sentCount >= $batchLimit) {
 		$params['abort']	= TRUE;
 
-		// Uitgebreide watchdog logging PER GEABORTEERDE EMAIL
 		if (function_exists('wachthond')) {
 			$params_abort	= [
-				'status'		=> 'ABORTED (Doorgeschoven naar volgende cron-run)',
+				'status'		=> $isBlocked ? 'ABORTED (Template validatie mislukt — zie alert-mail)' : 'ABORTED (Doorgeschoven naar volgende cron-run)',
 				'contact_id'	=> $contactId,
 				'email'			=> $toEmail,
+				'schedule_id'	=> $scheduleId,
 			];
-			wachthond($extdebug, 7, "geaborteerd_{$toEmail}",			$params_abort);
+			wachthond($extdebug, 7, "geaborteerd_{$toEmail}", $params_abort);
 		}
-		
 		return;
 	}
 
-	// 4. TOEGELATEN: We hogen de teller op
+	// 4. TOEGELATEN: teller ophogen
 	$sentCount++;
 
-	// Uitgebreide watchdog logging PER TOEGESTANE EMAIL
 	if (function_exists('wachthond')) {
-		$params_allow		= [
-			'status'		=> 'ALLOWED (Wordt nu verzonden)',
-			'contact_id'	=> $contactId,
-			'email'			=> $toEmail,
-			'subject'		=> $subject,
-			'voortgang'		=> "{$sentCount} van de {$batchLimit} in deze batch verwerkt",
+		$params_allow	= [
+			'status'	=> 'ALLOWED (Wordt nu verzonden)',
+			'contact_id'=> $contactId,
+			'email'		=> $toEmail,
+			'subject'	=> $subject,
+			'voortgang'	=> "{$sentCount} van de {$batchLimit} in deze batch verwerkt",
 		];
-		wachthond($extdebug, 4, "toegestaan_{$sentCount}",			$params_allow);
+		wachthond($extdebug, 3, "toegestaan_{$sentCount}", $params_allow);
 	}
-	
-	// Ook in de reguliere CiviCRM log per e-mail
+
 	Civi::log()->debug("batchreminders: Verzonden ({$sentCount}/{$batchLimit}) | Contact ID: {$contactId} | Email: {$toEmail}");
+}
+
+/**
+ * Haalt de actieve cluster op: alle msg_template_ids + schedule_ids in de huidige wachtrij.
+ *
+ * @return array  msg_template_id => ['title' => string, 'schedule_ids' => int[]]
+ */
+function _batchreminders_get_cluster() {
+	$dao		= CRM_Core_DAO::executeQuery("
+		SELECT DISTINCT S.id AS schedule_id, S.msg_template_id, S.title
+		FROM   civicrm_action_log      AS L
+		JOIN   civicrm_action_schedule AS S ON L.action_schedule_id = S.id
+		WHERE  L.action_date_time  IS NULL
+		AND    S.msg_template_id   IS NOT NULL
+	");
+	$cluster	= [];
+	while ($dao->fetch()) {
+		$tid = $dao->msg_template_id;
+		if (!isset($cluster[$tid])) {
+			$cluster[$tid] = ['title' => $dao->title, 'schedule_ids' => []];
+		}
+		$cluster[$tid]['schedule_ids'][] = (int) $dao->schedule_id;
+	}
+	return $cluster;
+}
+
+/**
+ * Valideert elke template in de cluster via de markup- en tokenscripts.
+ *
+ * Geeft terug welke templates OK zijn (sync + versturen) en welke geblokkeerd worden.
+ * De $execFn parameter maakt de functie testbaar: in tests stuur je een fake callback,
+ * in productie gebruikt je de standaard PHP exec().
+ *
+ * Validatieresultaten worden gecached in /tmp (per template-id). Cache is geldig zolang:
+ *   - het bestand <6 uur oud is, EN
+ *   - de template niet is gewijzigd na de cache-aanmaak.
+ * Zo wordt 9 sec exec-overhead per template gereduceerd naar <1 ms op opeenvolgende runs.
+ * Het cachepad is alleen actief op het productiepad ($execFn === NULL).
+ *
+ * @param  array         $clusterTemplates  Uitvoer van _batchreminders_get_cluster()
+ * @param  string        $scriptDir         Pad naar /usr/local/bin/templates
+ * @param  callable|null $execFn            Optionele exec-vervanger voor tests:
+ *                                          fn(string $cmd): ['output' => string[], 'exit' => int]
+ * @return array  [
+ *   'ok_ids'      => int[],   // template-ids die de validatie haalden
+ *   'blocked_ids' => int[],   // action_schedule_ids die overgeslagen worden
+ *   'errors'      => array,   // validatiefouten per template_id
+ * ]
+ */
+function _batchreminders_startup(array $clusterTemplates, string $scriptDir, ?callable $execFn = NULL) {
+	$okIds		= [];
+	$blockedIds	= [];
+	$errors		= [];
+
+	foreach ($clusterTemplates as $templateId => $info) {
+		$tid	= (int) $templateId;
+
+		if ($execFn !== NULL) {
+			// Testpad: gebruik de meegegeven callback
+			$markupResult	= $execFn("{$scriptDir}/civicrm_templates_markup.sh -q -c s {$tid}");
+			$tokenResult	= $execFn("{$scriptDir}/civicrm_templates_tokens.sh -q {$tid}");
+		}
+		else {
+			// Productiepad: controleer cache vóór de dure exec-aanroepen.
+			// Cache is geldig als: bestand bestaat + < 6 uur oud + template niet
+			// gewijzigd na aanmaken cache (modificatiedatum geeft template-versie weer).
+			$cacheFile		= "/tmp/batchreminders_valid_{$tid}.ok";
+			$tplModified	= (int) CRM_Core_DAO::singleValueQuery(
+				"SELECT UNIX_TIMESTAMP(modified_date) FROM civicrm_msg_template WHERE id = %1",
+				[1 => [$tid, 'Integer']]
+			);
+			$cacheAge		= file_exists($cacheFile) ? (time() - filemtime($cacheFile)) : PHP_INT_MAX;
+			$cacheValid		= $cacheAge < 21600 && filemtime((string)$cacheFile) > $tplModified;
+
+			if ($cacheValid) {
+				$okIds[]	= $tid;
+				Civi::log()->debug("batchreminders: Template {$tid} ({$info['title']}) OK (cache, {$cacheAge}s oud).");
+				continue;
+			}
+
+			// Cache niet geldig: voer de validatiescripts uit.
+			$markupOut	= [];
+			$markupExit	= 0;
+			exec("'{$scriptDir}/civicrm_templates_markup.sh' -q -c s {$tid} 2>&1", $markupOut, $markupExit);
+			$markupResult	= ['output' => $markupOut, 'exit' => $markupExit];
+
+			$tokenOut	= [];
+			$tokenExit	= 0;
+			exec("'{$scriptDir}/civicrm_templates_tokens.sh' -q {$tid} 2>&1", $tokenOut, $tokenExit);
+			$tokenResult	= ['output' => $tokenOut, 'exit' => $tokenExit];
+		}
+
+		$markupFailed	= ($markupResult['exit'] !== 0);
+		$tokenFailed	= ($tokenResult['exit']  !== 0);
+
+		if ($markupFailed || $tokenFailed) {
+			$errors[$tid]	= [
+				'template_id'	=> $tid,
+				'reminder'		=> $info['title'],
+				'schedule_ids'	=> $info['schedule_ids'],
+				'markup_exit'	=> $markupResult['exit'],
+				'token_exit'	=> $tokenResult['exit'],
+				'markup_output'	=> implode("\n", $markupResult['output']),
+				'token_output'	=> implode("\n", $tokenResult['output']),
+			];
+			$blockedIds		= array_merge($blockedIds, $info['schedule_ids']);
+			Civi::log()->error("batchreminders: Validatie MISLUKT voor template {$tid} ({$info['title']}) — schedules " . implode(', ', $info['schedule_ids']) . " overgeslagen.");
+		}
+		else {
+			$okIds[]	= $tid;
+			Civi::log()->debug("batchreminders: Template {$tid} ({$info['title']}) OK.");
+
+			// Schrijf cache zodat de volgende run de exec-aanroepen kan overslaan.
+			// Alleen op het productiepad (execFn === NULL), anders hebben we geen $cacheFile.
+			if ($execFn === NULL && isset($cacheFile)) {
+				file_put_contents($cacheFile, '');
+			}
+		}
+	}
+
+	return [
+		'ok_ids'		=> $okIds,
+		'blocked_ids'	=> $blockedIds,
+		'errors'		=> $errors,
+	];
+}
+
+/**
+ * Stuurt de alert-mail naar webteam bij validatiefouten.
+ *
+ * @param array  $errors    Validatiefouten uit _batchreminders_startup()
+ * @param int    $okCount   Aantal templates dat wél door de validatie kwam
+ * @param string $toEmail   E-mailadres van webteam
+ */
+function _batchreminders_send_alert(array $errors, int $okCount, string $toEmail) {
+	$errorRowsHtml	= '';
+	$errorRowsText	= [];
+
+	foreach ($errors as $err) {
+		$reminderEsc		= htmlspecialchars($err['reminder']);
+		$markupOut			= htmlspecialchars($err['markup_output']);
+		$tokenOut			= htmlspecialchars($err['token_output']);
+		$scheduleStr		= implode(', ', $err['schedule_ids']);
+
+		$errorRowsHtml	.= "<tr style='border-bottom:1px solid #eee;'>
+			<td style='padding:8px 12px;font-weight:bold;white-space:nowrap;'>#{$err['template_id']}</td>
+			<td style='padding:8px 12px;'>{$reminderEsc}<br><span style='color:#888;font-size:12px;'>schedule: {$scheduleStr}</span></td>
+			<td style='padding:8px 12px;color:#c00;'>" . ($err['markup_exit'] !== 0 ? "[MARKUP] {$markupOut}" : '<span style="color:#2a2">OK</span>') . "</td>
+			<td style='padding:8px 12px;color:#c00;'>" . ($err['token_exit']  !== 0 ? "[TOKEN] {$tokenOut}"   : '<span style="color:#2a2">OK</span>') . "</td>
+		</tr>";
+
+		$errorRowsText[]	= "#{$err['template_id']} {$err['reminder']} (schedule: {$scheduleStr})";
+		if ($err['markup_exit'] !== 0) { $errorRowsText[] = "  [MARKUP] {$err['markup_output']}"; }
+		if ($err['token_exit']  !== 0) { $errorRowsText[] = "  [TOKEN]  {$err['token_output']}";  }
+	}
+
+	$htmlBody	= "
+		<div style='font-family:Arial,sans-serif;max-width:700px;margin:0 auto;'>
+		<h2 style='color:#c00;border-bottom:2px solid #c00;padding-bottom:8px;'>
+			&#9888; Batchreminders — validatiefout in cluster
+		</h2>
+		<p>Één of meer templates zijn niet door de validatie gekomen.<br>
+		   <strong>De onderstaande reminders zijn overgeslagen.</strong>
+		   " . ($okCount > 0 ? "Reminders met gezonde templates ({$okCount}) zijn wél verstuurd." : "") . "<br>
+		   Corrigeer de templates en wacht op de volgende cron-run.</p>
+		<table style='width:100%;border-collapse:collapse;margin-top:16px;font-size:14px;'>
+			<thead>
+				<tr style='background:#f5f5f5;'>
+					<th style='padding:8px 12px;text-align:left;'>Template</th>
+					<th style='padding:8px 12px;text-align:left;'>Reminder</th>
+					<th style='padding:8px 12px;text-align:left;'>Markup</th>
+					<th style='padding:8px 12px;text-align:left;'>Token</th>
+				</tr>
+			</thead>
+			<tbody>{$errorRowsHtml}</tbody>
+		</table>
+		<p style='margin-top:24px;font-size:12px;color:#888;'>
+			Verstuurd door nl.onvergetelijk.batchreminders
+		</p>
+		</div>
+	";
+
+	$alertParams	= [
+		'toEmail'	=> $toEmail,
+		'toName'	=> 'Webteam OZK',
+		'from'		=> 'info@onvergetelijk.nl',
+		'subject'	=> '[OZK] Batchreminders — validatiefout, reminders deels overgeslagen',
+		'html'		=> $htmlBody,
+		'text'		=> "Validatiefout in batchreminders — onderstaande reminders overgeslagen.\n\n" . implode("\n", $errorRowsText) . "\n\nCorrigeer de templates en wacht op de volgende cron-run.",
+	];
+	\CRM_Utils_Mail::send($alertParams);
 }
