@@ -190,10 +190,9 @@ function _batchreminders_startup(array $clusterTemplates, string $scriptDir, ?ca
 			// Cache is geldig als: bestand bestaat + < 6 uur oud + template niet
 			// gewijzigd na aanmaken cache (modificatiedatum geeft template-versie weer).
 			$cacheFile		= "/tmp/batchreminders_valid_{$tid}.ok";
-			$tplModified	= (int) CRM_Core_DAO::singleValueQuery(
-				"SELECT UNIX_TIMESTAMP(modified_date) FROM civicrm_msg_template WHERE id = %1",
-				[1 => [$tid, 'Integer']]
-			);
+			// modified_date bestaat niet in civicrm_msg_template; gebruik 0 zodat
+			// de cache alleen op bestandsleeftijd wordt beoordeeld.
+			$tplModified	= 0;
 			$cacheAge		= file_exists($cacheFile) ? (time() - filemtime($cacheFile)) : PHP_INT_MAX;
 			$cacheValid		= $cacheAge < 21600 && filemtime((string)$cacheFile) > $tplModified;
 
