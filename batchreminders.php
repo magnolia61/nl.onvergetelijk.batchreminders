@@ -10,6 +10,13 @@ if (!defined('CIVICRM_SYSTEM')) { return; }
  * daadwerkelijk via SMTP de deur uit gaat.
  * We gebruiken dit moment om in te grijpen, te tellen, en extensief
  * te loggen per individuele e-mail (zowel toegestaan als geaborteerd).
+ *
+ * Verwante alterMailParams-hooks elders (géén overlap in verantwoordelijkheid):
+ * - nl.onvergetelijk.cssinliner: HTML/CSS-opmaak vlak vóór verzending.
+ * - nl.onvergetelijk.event: registreert de token {event.gcalendar_link} via
+ *   civi.token.list/eval (GEEN alterMailParams) — agenda-link voor "Add to calendar".
+ * Deze hook (batchreminders) is CLI-only (zie guard hieronder) en doet uitsluitend
+ * rate-limiting/logging; vult geen tokens of mail-inhoud.
  */
 function batchreminders_civicrm_alterMailParams(&$params, $context) {
 
