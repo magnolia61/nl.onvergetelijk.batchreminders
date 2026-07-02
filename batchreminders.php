@@ -17,6 +17,17 @@ if (!defined('CIVICRM_SYSTEM')) { return; }
  *   civi.token.list/eval (GEEN alterMailParams) — agenda-link voor "Add to calendar".
  * Deze hook (batchreminders) is CLI-only (zie guard hieronder) en doet uitsluitend
  * rate-limiting/logging; vult geen tokens of mail-inhoud.
+ *
+ * BELANGRIJK (2-jul-2026): de template-validatie (exec() naar civicrm_templates_markup.sh
+ * / _tokens.sh, tot 9s per template, oplopend tot enkele minuten bij een cold cache omdat
+ * die scripts zelf `timeout 180` naar html-validate gebruiken) draait NIET meer hier.
+ * Die validatie + de body_html/body_text/subject-sync liep voorheen synchroon in het eerste
+ * e-mailtje van elke send_reminder-cronrun, terwijl de PHP-cron een open MySQL-connectie
+ * vasthield — een reëel risico op een hangende/verbroken DB-connectie tijdens het verzenden.
+ * Beide zijn verplaatst naar _batchreminders_prewarm(), die op een EIGEN, onafhankelijke
+ * cronjob draait (zie bin/prewarm.php + cron-civicrm-batchreminders-prewarm.sh). Deze hook
+ * leest hier alleen nog het resultaat (welke schedule_ids geblokkeerd zijn) uit een lichte
+ * state-file — geen exec(), geen validatie-DB-query, geen sync-UPDATE meer in het verzendpad.
  */
 function batchreminders_civicrm_alterMailParams(&$params, $context) {
 
@@ -26,8 +37,6 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 
 	$batchLimit				= 25;
 	$extdebug 				= 'batchreminders';
-	$templateScriptDir		= '/usr/local/bin/templates';
-	$webteamEmail			= 'webteam@onvergetelijk.nl';
 
 	// Bescherming: Limiteer alleen automatische achtergrondprocessen (cli/cron)
 	if (php_sapi_name() !== 'cli') {
@@ -55,39 +64,11 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 			wachthond($extdebug, 2, "########################################################################");
 		}
 
-		// 1.1 Haal de actieve cluster op en valideer + sync via losse functie
-		$clusterTemplates	= _batchreminders_get_cluster();
-		$startup			= _batchreminders_startup($clusterTemplates, $templateScriptDir);
-		$blockedScheduleIds	= $startup['blocked_ids'];
+		// 1.1 Lees het resultaat van de laatste prewarm-run (lichte file-read, geen exec/DB)
+		$blockedScheduleIds	= _batchreminders_load_blocked_schedules();
 
 		if (function_exists('wachthond')) {
-			wachthond($extdebug, 3, 'cluster_templates',    $clusterTemplates);
 			wachthond($extdebug, 3, 'blocked_schedule_ids', $blockedScheduleIds);
-		}
-
-		// 1.2 Alert sturen als er fouten waren
-		if (!empty($startup['errors'])) {
-			_batchreminders_send_alert($startup['errors'], count($startup['ok_ids']), $webteamEmail);
-
-			if (function_exists('wachthond')) {
-				wachthond($extdebug, 1, "### VALIDATIEFOUTEN — " . count($blockedScheduleIds) . " SCHEDULES OVERGESLAGEN", "[GEDEELTELIJK]");
-				wachthond($extdebug, 3, 'validation_errors', $startup['errors']);
-			}
-		}
-
-		// 1.3 Sync template-inhoud naar reminders die de validatie haalden
-		if (!empty($startup['ok_ids'])) {
-			$okIds	= implode(',', array_map('intval', $startup['ok_ids']));
-			CRM_Core_DAO::executeQuery("
-				UPDATE civicrm_action_schedule AS S
-				INNER JOIN civicrm_msg_template AS M ON S.msg_template_id = M.id
-				SET    S.body_html  = M.msg_html,
-				       S.body_text  = M.msg_text,
-				       S.subject    = M.msg_subject
-				WHERE  S.msg_template_id IN ({$okIds})
-				AND    S.body_html != M.msg_html
-			");
-			Civi::log()->info("batchreminders: Template-sync voltooid voor: " . implode(', ', $startup['ok_ids']));
 		}
 	}
 
@@ -320,4 +301,154 @@ function _batchreminders_send_alert(array $errors, int $okCount, string $toEmail
 		'text'		=> "Validatiefout in batchreminders — onderstaande reminders overgeslagen.\n\n" . implode("\n", $errorRowsText) . "\n\nCorrigeer de templates en wacht op de volgende cron-run.",
 	];
 	\CRM_Utils_Mail::send($alertParams);
+}
+
+/**
+ * Pad naar de state-file die _batchreminders_prewarm() schrijft en de
+ * alterMailParams-hook leest. Losse functie zodat tests 'm kunnen overschrijven
+ * zonder de echte /tmp aan te raken.
+ */
+function _batchreminders_state_file(): string {
+	return '/tmp/batchreminders_blocked_schedules.json';
+}
+
+/**
+ * Leest het geblokkeerde-schedules-resultaat van de laatste prewarm-run.
+ *
+ * Puur een file-read + json_decode — geen exec(), geen DB-query. Dit is precies
+ * waarom de validatie hieruit is getrokken: dit stukje mag in het verzendpad
+ * blijven staan omdat het onder alle omstandigheden in <1ms klaar is.
+ *
+ * Fail-open: ontbreekt de state-file (prewarm heeft nog nooit gedraaid) dan
+ * worden er geen schedules geblokkeerd — dat is niet slechter dan de situatie
+ * vóór de validatielaag bestond. Is de file ouder dan $maxAgeSeconds (de prewarm-
+ * cron lijkt gestopt), dan gebruiken we nog wel de laatst bekende blocked-lijst
+ * (beter dan niets) maar loggen we een error zodat het opvalt.
+ *
+ * @param  int $maxAgeSeconds  Vanaf wanneer de state als verouderd geldt (default 20 min).
+ * @return int[]  action_schedule_ids die overgeslagen moeten worden.
+ */
+function _batchreminders_load_blocked_schedules(int $maxAgeSeconds = 1200): array {
+	$stateFile	= _batchreminders_state_file();
+
+	if (!file_exists($stateFile)) {
+		Civi::log()->warning("batchreminders: geen prewarm-state gevonden ({$stateFile}) — nog geen enkele run geweest? Niets wordt geblokkeerd.");
+		return [];
+	}
+
+	$age	= time() - filemtime($stateFile);
+	if ($age > $maxAgeSeconds) {
+		Civi::log()->error("batchreminders: prewarm-state is {$age}s oud (drempel {$maxAgeSeconds}s) — draait de prewarm-cron nog? Laatst bekende blocked-lijst wordt gebruikt.");
+	}
+
+	$raw	= @file_get_contents($stateFile);
+	$data	= json_decode((string) $raw, TRUE);
+
+	if (!is_array($data) || !isset($data['blocked_ids']) || !is_array($data['blocked_ids'])) {
+		Civi::log()->error("batchreminders: prewarm-state onleesbaar/corrupt ({$stateFile}) — niets wordt geblokkeerd.");
+		return [];
+	}
+
+	return array_map('intval', $data['blocked_ids']);
+}
+
+/**
+ * Synct body_html/body_text/subject van gevalideerde templates naar hun schedules.
+ * Losgetrokken uit de oude inline UPDATE in de hook zodat _batchreminders_prewarm()
+ * 'm buiten het verzendpad kan aanroepen.
+ *
+ * @param  int[] $okIds  Template-ids die de validatie haalden.
+ * @return int    Aantal daadwerkelijk bijgewerkte schedule-rijen.
+ */
+function _batchreminders_sync_templates(array $okIds): int {
+	if (empty($okIds)) {
+		return 0;
+	}
+
+	$idList	= implode(',', array_map('intval', $okIds));
+	CRM_Core_DAO::executeQuery("
+		UPDATE civicrm_action_schedule AS S
+		INNER JOIN civicrm_msg_template AS M ON S.msg_template_id = M.id
+		SET    S.body_html  = M.msg_html,
+		       S.body_text  = M.msg_text,
+		       S.subject    = M.msg_subject
+		WHERE  S.msg_template_id IN ({$idList})
+		AND    S.body_html != M.msg_html
+	");
+	$affected	= (int) CRM_Core_DAO::singleValueQuery('SELECT ROW_COUNT()');
+
+	Civi::log()->info("batchreminders: Template-sync voltooid voor: " . implode(', ', $okIds) . " ({$affected} schedule-rijen bijgewerkt).");
+
+	return $affected;
+}
+
+/**
+ * Prewarm-entrypoint: draait ONAFHANKELIJK van job.send_reminder, op zijn eigen cronjob
+ * (zie bin/prewarm.php + cron-civicrm-batchreminders-prewarm.sh). Doet al het werk dat
+ * vroeger synchroon in alterMailParams() zat: cluster ophalen, valideren (incl. de
+ * exec()-aanroepen bij een cold cache), templates syncen, alert-mail bij fouten, en
+ * schrijft tot slot de blocked-schedules state-file die de hook leest.
+ *
+ * Schrijft atomisch (tmp-file + rename) zodat de hook nooit een half geschreven
+ * state-file kan lezen terwijl deze functie nog bezig is.
+ *
+ * @return array  ['ok_ids' => int[], 'blocked_ids' => int[], 'errors' => array, 'synced' => int]
+ */
+function _batchreminders_prewarm(): array {
+	$templateScriptDir	= '/usr/local/bin/templates';
+	$webteamEmail		= 'webteam@onvergetelijk.nl';
+	$extdebug			= 'batchreminders';
+
+	if (function_exists('wachthond')) {
+		wachthond($extdebug, 2, "########################################################################");
+		wachthond($extdebug, 1, "### BATCHREMINDERS PREWARM - START",                       "[PREWARM]");
+		wachthond($extdebug, 2, "########################################################################");
+	}
+
+	$clusterTemplates	= _batchreminders_get_cluster();
+	$startup			= _batchreminders_startup($clusterTemplates, $templateScriptDir);
+
+	if (function_exists('wachthond')) {
+		wachthond($extdebug, 3, 'cluster_templates', $clusterTemplates);
+		wachthond($extdebug, 3, 'startup_result',    $startup);
+	}
+
+	if (!empty($startup['errors'])) {
+		_batchreminders_send_alert($startup['errors'], count($startup['ok_ids']), $webteamEmail);
+
+		if (function_exists('wachthond')) {
+			wachthond($extdebug, 1, "### VALIDATIEFOUTEN — " . count($startup['blocked_ids']) . " SCHEDULES GEBLOKKEERD", "[GEDEELTELIJK]");
+			wachthond($extdebug, 3, 'validation_errors', $startup['errors']);
+		}
+	}
+
+	$synced	= _batchreminders_sync_templates($startup['ok_ids']);
+
+	// Atomisch schrijven: eerst naar een tmp-bestand in dezelfde map (dus zelfde filesystem,
+	// rename() is dan atomisch), dan pas de definitieve naam erover heen zetten.
+	$stateFile	= _batchreminders_state_file();
+	$tmpFile	= $stateFile . '.tmp' . getmypid();
+	file_put_contents($tmpFile, json_encode([
+		'blocked_ids'	=> array_values($startup['blocked_ids']),
+		'generated_at'	=> date('Y-m-d H:i:s'),
+	]));
+	rename($tmpFile, $stateFile);
+
+	if (function_exists('wachthond')) {
+		wachthond($extdebug, 1, "### BATCHREMINDERS PREWARM - KLAAR", "[PREWARM]");
+		wachthond($extdebug, 3, 'resultaat', [
+			'ok_ids'      => $startup['ok_ids'],
+			'blocked_ids' => $startup['blocked_ids'],
+			'synced'      => $synced,
+		]);
+	}
+
+	Civi::log()->info("batchreminders: Prewarm klaar — " . count($startup['ok_ids']) . " ok, " . count($startup['blocked_ids']) . " geblokkeerd, {$synced} gesynct.");
+
+	return [
+		'ok_ids'      => $startup['ok_ids'],
+		'blocked_ids' => $startup['blocked_ids'],
+		'errors'      => $startup['errors'],
+		'synced'      => $synced,
+	];
 }
