@@ -1,120 +1,164 @@
 # nl.onvergetelijk.batchreminders
 
-Batchgewijze en gevalideerde verzending van CiviCRM Scheduled Reminders voor OZK.
+Batchgewijze, geprioriteerde verzending van CiviCRM Scheduled Reminders — met de
+render-limiter als kern: niet alleen het *verzenden* maar ook het *renderen* is
+per cron-run begrensd.
 
 Maintainer: Richard van Oosterhout <webteam@onvergetelijk.nl>
+
+**Versie 4.0 (2-jul-2026)** — volledige herbouw na het incident van die dag
+(zie "Geschiedenis" onderaan).
 
 ---
 
 ## Waarom deze extensie?
 
-CiviCRM's standaard `job.send_reminder` verzendt alle openstaande reminders in één run, zonder limiet. Bij OZK levert dat drie problemen op:
+CiviCRM core rendert per schedule **alle** wachtende ontvangers in één keer
+(`TokenProcessor->evaluate()` over de volledige set) vóórdat de eerste mail
+verstuurd wordt. Bij OZK betekent dat: 126 ontvangers × het zware
+Smarty-headerwerk (~60KB, honderden tokens) = minuten aan CPU per schedule,
+terwijl de MySQL-connectie openstaat. Dat gaf historisch drie soorten ellende:
 
-1. **Overbelasting** — een grote batch kan de SMTP-server of het geheugen overbelasten.
-2. **Ongeldige templates** — een gebroken template (Smarty-fout of wees-token) gaat er zonder waarschuwing uit.
-3. **Duplicaten na deadlock** — als een run afbreekt door een MySQL-deadlock, blijven `action_log`-rijen op `action_date_time = NULL` staan; de volgende run ziet die contacten opnieuw als "nog niet verstuurd" en stuurt opnieuw.
-
-Deze extensie pakt alle drie aan via de `alterMailParams`-hook.
-
----
-
-## Wat doet de extensie?
-
-### 1. Batch-limiet (`$batchLimit = 25`)
-
-Per cron-run worden maximaal 25 reminders doorgelaten. De overige worden geaborteerd (`$params['abort'] = TRUE`) en worden automatisch opgepakt in de volgende run. Zo worden lange runs geknipt in beheersbare stukken.
-
-### 2. Template-validatie bij opstart
-
-Bij de eerste mail van een run wordt de volledige actieve cluster gevalideerd (alle `action_schedule`-records met openstaande `action_log`-entries):
-
-- **Markup-check** — `civicrm_templates_markup.sh -q -c s {template_id}`
-- **Token-check** — `civicrm_templates_tokens.sh -q {template_id}`
-
-Templates die een van deze checks niet doorstaan worden **geblokkeerd**: hun schedules worden voor deze run overgeslagen en er gaat een alert-mail naar webteam.
-
-#### Validatie-cache
-
-Validatie kost ~9 seconden per template (shell-exec). Om dat bij iedere run te vermijden wordt het resultaat gecached in `/tmp/batchreminders_valid_{id}.ok`. De cache is geldig zolang:
-- het bestand jonger is dan 6 uur, **en**
-- de template niet is gewijzigd na de cache-aanmaak.
-
-Bij cache-hit wordt de exec overgeslagen en is de check <1 ms.
-
-### 3. Template-sync
-
-Templates die de validatie halen worden automatisch gesynchroniseerd: de inhoud van `civicrm_msg_template` (de bewerkbare bron) wordt naar `civicrm_action_schedule` (de werkkopie) geschreven als ze verschillen. Zo loopt de reminder altijd op de actuele versie.
+1. **"MySQL server has gone away"** midden in een run (idle connecties geoogst,
+   monit-kills op CPU-verbruik, OOM);
+2. **Weggegooid werk** — een naïeve verzend-limiet (alleen in `alterMailParams`)
+   kapt pas af NÁ het renderen, dus al dat werk werd elke run herhaald;
+3. **Duplicaten** wanneer een afgebroken run zijn action_log-administratie niet
+   kon afronden.
 
 ---
 
-## De ACL-deadlock en het duplicaten-probleem
-
-### Achtergrond
-
-CiviCRM pre-inserteert `action_log`-rijen met `action_date_time = NULL` vóórdat een mail de deur uitgaat. Na verzending wordt de timestamp ingevuld. De eligibility-query controleert op timestamp: `NULL` = nog niet verstuurd.
-
-Bij een nieuwe inschrijving (registratie → groep-toevoeging → ACL-cache-flush) voerde CiviCRM een `TRUNCATE TABLE civicrm_acl_contact_cache` uit. Dat is DDL: het veroorzaakt een impliciete commit en een tabel-metadata-versie-bump. Een gelijktijdige reminder-run die dezelfde tabel leest, krijgt MySQL-fout **1412** ("Table definition has changed") of **1213** (deadlock) en breekt af — vóórdat de timestamps zijn ingevuld. Alle NULL-entries van die run blijven staan.
-
-### Hoe dit opgelost is
-
-Drie lagen, van preventief naar reactief:
-
-| Laag | Wat | Waar |
-|------|-----|------|
-| **1. Root cause** | `TRUNCATE` → `DELETE` in `CRM/ACL/BAO/Cache.php` (OZK M62) | Core-patch, geregistreerd in `patch-civicrm-core.sh` |
-| **2. Nachtelijk vangnet** | Sqltask 238 — dagelijks 02:30, stempelt stale NULLs, alert als count > 0 | CiviCRM sqltasks |
-| **3. Near-realtime monitor** | `cron-civicrm-reminder-nullfix.sh` — elke 30 min, checkt flock-slot van reminder-job | `/usr/local/bin/maintenance/` |
-
-#### Optionele crontab-regel voor laag 3
+## Architectuur
 
 ```
-*/30 * * * * webteam /usr/local/bin/maintenance/cron-runner.sh none /usr/local/bin/maintenance/cron-civicrm-reminder-nullfix.sh
+┌─ prewarm-cron (elke 5 min, eigen proces) ──────────────────────────┐
+│  valideert templates (exec markup/tokens-scripts, traag bij cold   │
+│  cache), synct template → schedule, schrijft state-file            │
+└──────────────────────────┬─────────────────────────────────────────┘
+                           │  /tmp/batchreminders_blocked_schedules.json
+                           ▼
+┌─ job.send_reminder (elke 2 min, via cron-runner + lock) ───────────┐
+│  1. civi.actionSchedule.prepareMailingQuery-listener                │
+│     → bouwt ÉÉN keer per run de prioriteitsranking + budget-        │
+│       verdeling en zet LIMIT op elke schedule-query                 │
+│  2. alterMailParams-hook                                            │
+│     → telt verzendingen; zelfde batchsize als VANGNET               │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-De monitor gebruikt een state-file (`/tmp/nullfix_max_id.state`) om alleen entries aan te raken die er al waren vóór de vorige run, en slaat een run over als de reminder-job actief is (`flock -n /tmp/civi_reminder.lock`).
+### 1. Render-limiter (`_batchreminders_limit_mailing_query`)
+
+Listener op `civi.actionSchedule.prepareMailingQuery`. Zet een `LIMIT` op de
+wachtrij-query zodat core nooit meer ontvangers ophaalt (en rendert) dan het
+run-budget. Niet-geselecteerde rijen behouden `action_date_time = NULL` en
+komen automatisch in de volgende run aan de beurt.
+
+### 2. Prioriteitsranking (`_batchreminders_rank_and_allocate`)
+
+Het budget wordt greedy verdeeld in deze volgorde:
+
+1. **Oudste wachtende dag eerst** (dag-niveau; herleid uit de
+   nullfix-snapshothistorie `/tmp/nullfix_max_id.history`, want
+   `civicrm_action_log` heeft geen aanmaakdatum-kolom).
+2. **Chronologie-emmer van het reminder-type** — de mailreeks per kamp is een
+   lopend verhaal (28wk → 4wk-info → 1wk → 2dgn → 1dag). Langste vooruitloop
+   eerst: emmer 1 = >2 weken, emmer 2 = ≤2 weken (ook absolute-datum-schedules),
+   emmer 3 = ≤2 dagen. Grove emmers zodat een triviaal offset-verschil de
+   kampvolgorde niet overruled.
+3. **Kampvolgorde** KK → BK → TK → JK → TOP (herkend uit de schedule-titel;
+   samenstellingen als `KKBKTKJK` tellen als hun hoogst geprioriteerde kamp).
+4. **Leiding-templates** (JL/LEID in de titel) daarna.
+
+### 3. Batchsize: één knop (`batchreminders_batchsize`, default 25)
+
+Zelfde waarde voor render-limiet én verzend-vangnet — twee losse waarden zijn
+alleen correct als ze gelijk staan. Instelbaar via `Civi::settings()`.
+**Bij verhogen: de wrapper-timeout evenredig meeschalen** (zie Vangrails).
+
+### 4. Prewarm (`_batchreminders_prewarm` / `bin/prewarm.php`)
+
+De template-validatie (exec() naar `civicrm_templates_markup.sh`/`_tokens.sh`,
+~9s per template en tot minuten bij een cold cache door hun interne
+`timeout 180` naar html-validate) draait NIET in het verzendpad maar op een
+eigen cron. Resultaat gaat via een atomisch geschreven state-file
+(`/tmp/batchreminders_blocked_schedules.json`) naar de hooks. Geblokkeerde
+schedules krijgen `LIMIT 0` — die worden dus niet eens gerenderd.
+
+**Fail-open**: geen/corrupte/verouderde state ⇒ niets wordt geblokkeerd (wel
+gelogd). Liever een kapotte template versturen dan de keten stilleggen.
+
+### 5. Vangrails (defense in depth)
+
+| Laag | Mechanisme | Grens |
+|---|---|---|
+| 1 | batchsize + render-limiter | run is per ontwerp kort (~2-4 min) |
+| 2 | `timeout` in cron-civicrm-reminders.sh | 600s (formule: `3 × (10 + batchsize × 7)` sec) |
+| 3 | monit CPU-check | 98% / 30 cycli (~60 min) |
+| 4 | nullfix-cron | stempelt pas na **24 uur** onverstuurd (history-based) |
+
+---
+
+## Cron-opstelling
+
+```
+*/2  * * * *  cron-runner.sh /tmp/civi_reminder.lock  cron-civicrm-reminders.sh     # verzenden
+*/5  * * * *  cron-runner.sh <eigen lock>             cron-civicrm-batchreminders-prewarm.sh
+*/30 * * * *  cron-runner.sh none                     cron-civicrm-reminder-nullfix.sh
+```
+
+Doorvoer: 25 per ~4-5 min ≈ 300/uur — bewust een gestage druppel
+(deliverability: geen bursts; Gmail bulk-drempels beginnen pas bij ~5000/dag).
+
+## Monitoring
+
+`/usr/local/bin/templates/civicrm_templates_dashboard.sh` (of `-l` voor live)
+toont wachtrij per schedule, cron-status, locks, prewarm-state, geheugen/DB en
+een verwachting in gewone taal.
 
 ---
 
 ## Bestandsstructuur
 
 ```
-batchreminders.php              Hook-implementaties + hulpfuncties
-tests/phpunit/
-  Batchreminders/
-    StartupTest.php             7 unit-tests voor _batchreminders_startup()
+batchreminders.php                      # alle hooks + pure functies
+bin/prewarm.php                         # CLI-entrypoint prewarm (cv scr)
+settings/Batchreminders.setting.php     # batchreminders_batchsize
+tests/phpunit/Batchreminders/
+  RenderBudgetTest.php                  # classificatie, chronologie, ranking, allocatie
+  StartupTest.php                       # validatie-/blokkeerlogica (met exec-fake)
+  BlockedStateTest.php                  # fail-open contract van de state-file
 ```
 
-### Centrale functies
+### Pure functies (headless testbaar, geen Civi/DB)
 
 | Functie | Doel |
-|---------|------|
-| `batchreminders_civicrm_alterMailParams()` | Hook-entry: telt, valideert, limiteert per run |
-| `_batchreminders_get_cluster()` | Haalt actieve template+schedule-combinaties op uit de wachtrij |
-| `_batchreminders_startup()` | Valideert templates, bouwt ok/blocked-lijsten, schrijft cache |
-| `_batchreminders_send_alert()` | Stuurt HTML-alert bij validatiefouten |
-
-### Debug-kanalen (`ozk.debug.config.php`)
-
-| Kanaal | Drempel |
-|--------|---------|
-| `batchreminders` | 3 |
-
----
+|---|---|
+| `_batchreminders_classify_title()` | kamp (KK..TOP) + leiding uit schedule-titel |
+| `_batchreminders_urgency_bucket()` | chronologie-emmer uit offset+unit |
+| `_batchreminders_id_to_day()` | aanmaakdag van action_log-rij via snapshothistorie |
+| `_batchreminders_rank_and_allocate()` | prioriteit + greedy budgetverdeling |
+| `_batchreminders_parse_blocked_state()` | fail-open interpretatie prewarm-state |
+| `_batchreminders_startup()` | validatie-orkestratie (exec injecteerbaar) |
 
 ## Tests uitvoeren
 
 ```bash
 cd nl.onvergetelijk.batchreminders
-CIVICRM_UF="UnitTests" phpunit9 --configuration=phpunit.xml.dist
+phpunit9 --configuration=phpunit.xml.dist        # 49 tests, geen DB nodig
 ```
-
-De tests gebruiken een `$execFn`-callback zodat er geen DB of shell-aanroepen nodig zijn. De validatie-cache wordt alleen op het productiepad geschreven (`$execFn === NULL`), niet in tests.
 
 ---
 
-## Versiehistorie
+## Geschiedenis
 
-| Versie | Datum | Wijziging |
-|--------|-------|-----------|
-| 3.0.0 | 2026-05-14 | Initiële release |
-| 3.1.0 | 2026-06-27 | Batch 25 (was 10), validatie-cache (6u TTL), debug-level fix (4→3), totalRemaining filtert inactieve schedules; ACL deadlock-fix (M62) + sqltask 238 + monitor-script |
+- **V4.0 (2-jul-2026)** — render-limiter + prioriteitsranking + prewarm-cron +
+  batchsize-setting. Aanleiding: reminders kwamen al dagen niet aan. De keten
+  bleek op VIER punten tegelijk kapot: (1) core rendert alles vóór de eerste
+  send en de oude cap kwam te laat; (2) monit killde "gezond drukke" runs op
+  90% CPU / 5 cycli; (3) de 30-min-nullfix stempelde 442 legitieme wachtenden
+  weg als "verzonden"; (4) `outBound_option` stond sinds 1-jul op 5
+  (Redirect-to-Database) waardoor niets de server verliet. Alle vier gefixt;
+  zie memory `reminder_keten_overhaul.md` voor het volledige verhaal.
+- **V3.x (jun-2026)** — batch-cap in alterMailParams, template-validatie met
+  /tmp-cache, template-sync, alert-mail bij validatiefouten.
+- **V2/V1** — logging-hook; limiet in extern bash-script.

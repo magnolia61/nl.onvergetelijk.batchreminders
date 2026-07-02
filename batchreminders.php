@@ -555,6 +555,33 @@ function _batchreminders_state_file(): string {
 }
 
 /**
+ * Puur rekenwerk: interpreteert de inhoud van de prewarm-state-file — testbaar
+ * zonder Civi-bootstrap of filesystem. Fail-open op elke afwijking: liever een
+ * (mogelijk kapotte) reminder versturen dan de hele keten stil laten blokkeren.
+ *
+ * @param  string|null $raw            Ruwe file-inhoud (NULL = file bestaat niet).
+ * @param  int         $ageSeconds     Leeftijd van de file in seconden.
+ * @param  int         $maxAgeSeconds  Vanaf wanneer de state als verouderd geldt.
+ * @return array{blocked: int[], status: string}
+ *         status: ok | missing (geen file) | stale (te oud, lijst wél gebruikt) | corrupt
+ */
+function _batchreminders_parse_blocked_state(?string $raw, int $ageSeconds, int $maxAgeSeconds): array {
+	if ($raw === NULL) {
+		return ['blocked' => [], 'status' => 'missing'];
+	}
+
+	$data = json_decode($raw, TRUE);
+	if (!is_array($data) || !isset($data['blocked_ids']) || !is_array($data['blocked_ids'])) {
+		return ['blocked' => [], 'status' => 'corrupt'];
+	}
+
+	return [
+		'blocked'	=> array_map('intval', $data['blocked_ids']),
+		'status'	=> $ageSeconds > $maxAgeSeconds ? 'stale' : 'ok',
+	];
+}
+
+/**
  * Leest het geblokkeerde-schedules-resultaat van de laatste prewarm-run.
  *
  * Puur een file-read + json_decode — geen exec(), geen DB-query. Dit is precies
@@ -572,26 +599,27 @@ function _batchreminders_state_file(): string {
  */
 function _batchreminders_load_blocked_schedules(int $maxAgeSeconds = 1200): array {
 	$stateFile	= _batchreminders_state_file();
+	$exists		= file_exists($stateFile);
+	$raw		= $exists ? (string) @file_get_contents($stateFile) : NULL;
+	$age		= $exists ? (time() - filemtime($stateFile)) : 0;
 
-	if (!file_exists($stateFile)) {
-		Civi::log()->warning("batchreminders: geen prewarm-state gevonden ({$stateFile}) — nog geen enkele run geweest? Niets wordt geblokkeerd.");
-		return [];
+	$state = _batchreminders_parse_blocked_state($raw, $age, $maxAgeSeconds);
+
+	switch ($state['status']) {
+		case 'missing':
+			Civi::log()->warning("batchreminders: geen prewarm-state gevonden ({$stateFile}) — nog geen enkele run geweest? Niets wordt geblokkeerd.");
+			break;
+
+		case 'stale':
+			Civi::log()->error("batchreminders: prewarm-state is {$age}s oud (drempel {$maxAgeSeconds}s) — draait de prewarm-cron nog? Laatst bekende blocked-lijst wordt gebruikt.");
+			break;
+
+		case 'corrupt':
+			Civi::log()->error("batchreminders: prewarm-state onleesbaar/corrupt ({$stateFile}) — niets wordt geblokkeerd.");
+			break;
 	}
 
-	$age	= time() - filemtime($stateFile);
-	if ($age > $maxAgeSeconds) {
-		Civi::log()->error("batchreminders: prewarm-state is {$age}s oud (drempel {$maxAgeSeconds}s) — draait de prewarm-cron nog? Laatst bekende blocked-lijst wordt gebruikt.");
-	}
-
-	$raw	= @file_get_contents($stateFile);
-	$data	= json_decode((string) $raw, TRUE);
-
-	if (!is_array($data) || !isset($data['blocked_ids']) || !is_array($data['blocked_ids'])) {
-		Civi::log()->error("batchreminders: prewarm-state onleesbaar/corrupt ({$stateFile}) — niets wordt geblokkeerd.");
-		return [];
-	}
-
-	return array_map('intval', $data['blocked_ids']);
+	return $state['blocked'];
 }
 
 /**

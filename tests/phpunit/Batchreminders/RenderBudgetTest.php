@@ -186,4 +186,112 @@ class Batchreminders_RenderBudgetTest extends \PHPUnit\Framework\TestCase {
     $alloc = _batchreminders_rank_and_allocate($scheds, 25);
     $this->assertEquals([101 => 10, 102 => 10, 103 => 5], $alloc);
   }
+
+  public function testBatchsizeEen_MinimaleVerdeling(): void {
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(144, '2026-07-02', FALSE, 1, 100),
+    ], 1);
+    $this->assertEquals([144 => 1], $alloc);
+  }
+
+  public function testGeenSchedules_LegeVerdeling(): void {
+    $this->assertEquals([], _batchreminders_rank_and_allocate([], 25));
+  }
+
+  // ########################################################################
+  // ### 5. CLASSIFICATIE VAN ECHTE PRODUCTIE-TITELS (peiling 2-jul-2026)
+  // ########################################################################
+
+  public function testEchteTitels_Leiding(): void {
+    // JL-segment én LEID-woord komen beide voor in productie
+    $this->assertTrue(_batchreminders_classify_title('02_JL_24WEKEN_JUBILEUM_LEID_BIJNA')['leid']);
+    $this->assertTrue(_batchreminders_classify_title('CHECK_FOTO_LEID')['leid']);
+  }
+
+  public function testEchteTitels_ZonderKampOfLeiding_VallenAchteraan(): void {
+    // Geen kamp-token en geen leiding-token → camp 6 (na alle kampen)
+    $this->assertEquals(['leid' => FALSE, 'camp' => 6], _batchreminders_classify_title('GEBED_WEEK1'));
+    $this->assertEquals(6, _batchreminders_classify_title('Update Communication Preferences')['camp']);
+  }
+
+  public function testEchteTitels_Keukenteam_GeenValsKampOfLeid(): void {
+    // 'Keukenteam' bevat geen KK-substring ('K_K'/'euke') en geen LEID
+    $klass = _batchreminders_classify_title('HANDBOEK_Keukenteam');
+    $this->assertFalse($klass['leid']);
+    $this->assertEquals(6, $klass['camp']);
+  }
+
+  public function testEchteTitels_TopkampHerkend(): void {
+    $this->assertEquals(5, _batchreminders_classify_title('07_JD_4WEKEN_INFO_TOP')['camp']);
+  }
+
+  // ########################################################################
+  // ### 6. DAG-HERLEIDING: RANDGEVALLEN
+  // ########################################################################
+
+  public function testIdToDay_RijNieuwerDanAlleSnapshots_ValtTerugOpVandaag(): void {
+    $d1 = strtotime('2026-06-30 12:00');
+    // Rij-id 9999 is groter dan elke bekende max-id → geen snapshot kende hem
+    $this->assertEquals('2026-07-02', _batchreminders_id_to_day(9999, [[$d1, 1000]], '2026-07-02'));
+  }
+
+  public function testIdToDay_MeerdereSnapshotsZelfdeDag_PaktVroegste(): void {
+    $ochtend = strtotime('2026-07-01 08:00');
+    $middag  = strtotime('2026-07-01 14:00');
+    $this->assertEquals('2026-07-01', _batchreminders_id_to_day(500, [[$middag, 900], [$ochtend, 600]], '2026-07-02'));
+  }
+
+  public function testIdToDay_ExactOpDeGrens(): void {
+    $d1 = strtotime('2026-07-01 08:00');
+    // max-id == rij-id: de snapshot kende de rij (>=), dus die dag telt
+    $this->assertEquals('2026-07-01', _batchreminders_id_to_day(600, [[$d1, 600]], '2026-07-02'));
+  }
+
+  // ########################################################################
+  // ### 7. CHRONOLOGIE-EMMER: RANDGEVALLEN
+  // ########################################################################
+
+  public function testChronoBucket_MonthUnit(): void {
+    $this->assertEquals(1, _batchreminders_urgency_bucket('month', 1), '1 maand = vroeg in de reeks');
+  }
+
+  public function testChronoBucket_OnbekendeUnit_TeltAlsDagen(): void {
+    // Onbekende unit valt terug op 1 dag per eenheid (defensief)
+    $this->assertEquals(2, _batchreminders_urgency_bucket('fortnight', 5));
+  }
+
+  public function testChronoBucket_GrensExact2Dagen(): void {
+    $this->assertEquals(3, _batchreminders_urgency_bucket('day', 2),  '2 dagen = nog laat in de reeks');
+    $this->assertEquals(2, _batchreminders_urgency_bucket('day', 3),  '3 dagen = midden');
+  }
+
+  public function testChronoBucket_GrensExact2Weken(): void {
+    $this->assertEquals(2, _batchreminders_urgency_bucket('week', 2), '14 dagen = nog midden');
+    $this->assertEquals(1, _batchreminders_urgency_bucket('day', 15), '15 dagen = vroeg in de reeks');
+  }
+
+  // ########################################################################
+  // ### 8. INTEGRAAL: DE PRODUCTIESITUATIE VAN 2-JUL-2026
+  // ########################################################################
+
+  public function testProductiescenario_2jul2026(): void {
+    // De echte wachtrij van die dag: 8 × 4WEKEN (rustig) + stel dat er ook
+    // een NA1WEEK (midden) en een 2DAGEN (laat) hadden gestaan.
+    $scheds = [
+      $this->sched(144, '2026-07-02', FALSE, 1, 126, 1),   // 4WEKEN KK1
+      $this->sched(145, '2026-07-02', FALSE, 1, 104, 1),   // 4WEKEN KK2
+      $this->sched(146, '2026-07-02', FALSE, 2, 44,  1),   // 4WEKEN BK1
+      $this->sched(23,  '2026-07-02', FALSE, 1, 12,  2),   // NA1WEEK (midden)
+      $this->sched(42,  '2026-07-02', FALSE, 1, 6,   3),   // 2DAGEN (laat)
+      $this->sched(55,  '2026-07-02', TRUE,  1, 40,  1),   // leiding
+    ];
+    $alloc = _batchreminders_rank_and_allocate($scheds, 25);
+    // Verhaalvolgorde: eerst de 4WEKEN-reeks (vroegst), binnen die emmer KK1 eerst.
+    $this->assertEquals([144 => 25], $alloc);
+
+    // Als KK1 leeg is (pending 0), schuift alles door: KK2 aan de beurt.
+    $scheds[0]['pending'] = 0;
+    $alloc = _batchreminders_rank_and_allocate($scheds, 25);
+    $this->assertEquals([145 => 25], $alloc);
+  }
 }
