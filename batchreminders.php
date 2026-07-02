@@ -57,6 +57,32 @@ function _batchreminders_classify_title(string $title): array {
 }
 
 /**
+ * Deelt een schedule in een urgentie-emmer in op basis van zijn vooruitloop
+ * (start_action_offset + unit): hoe korter de lont, hoe sneller de inhoud
+ * veroudert, hoe urgenter. Grove emmers (geen exacte offset-volgorde) zodat
+ * een triviaal verschil (5 vs 7 dagen) de kampvolgorde niet overruled —
+ * zelfde redenering als dag-niveau i.p.v. uur-niveau bij de wachttijd.
+ *
+ * In de praktijk (peiling 2-jul-2026): hour 30-36, day 0-7, week 1-28.
+ *
+ * @param  string|null $unit    hour/day/week (NULL bij absolute_date-schedules).
+ * @param  int|null    $offset  Vooruitloop in $unit-eenheden.
+ * @return int  1 = spoed (<= 2 dagen), 2 = normaal (<= 2 weken, ook absolute
+ *              datum: bewust op die dag gepland), 3 = rustig (> 2 weken).
+ */
+function _batchreminders_urgency_bucket(?string $unit, ?int $offset): int {
+	if ($offset === NULL || $unit === NULL) {
+		return 2;
+	}
+	$perUnit	= ['hour' => 1 / 24, 'day' => 1, 'week' => 7, 'month' => 30];
+	$dagen		= $offset * ($perUnit[strtolower($unit)] ?? 1);
+	if ($dagen <= 2) {
+		return 1;
+	}
+	return $dagen <= 14 ? 2 : 3;
+}
+
+/**
  * Herleidt de (dag)datum waarop een action_log-rij is aangemaakt uit de
  * nullfix-snapshothistorie (/tmp/nullfix_max_id.history: per run "epoch max_id").
  * action_log heeft zelf geen aanmaakdatum-kolom; de vroegste snapshot waarvan de
@@ -82,19 +108,24 @@ function _batchreminders_id_to_day(int $id, array $history, string $fallback): s
  *
  * Prioriteit (voorkeur Richard, 2-jul-2026):
  *   1. oudste wachtende dag eerst (dag-niveau, niet uur-niveau)
- *   2. binnen een dag: deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
- *   3. daarna pas de leiding-templates
+ *   2. urgentie-emmer van het reminder-type: kortste vooruitloop eerst
+ *      (spoed <= 2 dgn, normaal <= 2 wkn, rustig > 2 wkn) — een NA1DAG-mail
+ *      gaat zo vóór een 4WEKEN-infomail, ongeacht kamp
+ *   3. binnen gelijke urgentie: deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
+ *   4. daarna pas de leiding-templates (binnen hun dag+urgentie-emmer)
  * Het budget wordt greedy uitgedeeld in die volgorde: het hoogst geprioriteerde
  * schedule wordt volledig bediend vóór het volgende aan de beurt komt.
+ * Bijvangst van groeperen per reminder-type: batches zijn homogeen per template
+ * (warme render-caches, leesbare "golven" in log en dashboard).
  *
- * @param  array $schedules  Per schedule: ['id'=>int,'day'=>'Y-m-d','leid'=>bool,'camp'=>int,'pending'=>int]
+ * @param  array $schedules  Per schedule: ['id'=>int,'day'=>'Y-m-d','urg'=>int,'leid'=>bool,'camp'=>int,'pending'=>int]
  * @param  int   $batchsize  Totaalbudget voor deze run.
  * @return array  schedule_id => toegekend budget (alleen schedules met budget > 0).
  */
 function _batchreminders_rank_and_allocate(array $schedules, int $batchsize): array {
 	usort($schedules, function($a, $b) {
-		return [$a['day'], (int) $a['leid'], $a['camp'], $a['id']]
-		   <=> [$b['day'], (int) $b['leid'], $b['camp'], $b['id']];
+		return [$a['day'], $a['urg'] ?? 2, (int) $a['leid'], $a['camp'], $a['id']]
+		   <=> [$b['day'], $b['urg'] ?? 2, (int) $b['leid'], $b['camp'], $b['id']];
 	});
 
 	$alloc		= [];
@@ -119,7 +150,8 @@ function _batchreminders_rank_and_allocate(array $schedules, int $batchsize): ar
  */
 function _batchreminders_build_allocation(array $blockedScheduleIds): array {
 	$dao = CRM_Core_DAO::executeQuery("
-		SELECT S.id, S.title, COUNT(L.id) AS pending, MIN(L.id) AS oldest_id
+		SELECT S.id, S.title, S.start_action_unit, S.start_action_offset,
+		       COUNT(L.id) AS pending, MIN(L.id) AS oldest_id
 		FROM   civicrm_action_log      L
 		JOIN   civicrm_action_schedule S ON S.id = L.action_schedule_id
 		WHERE  L.action_date_time IS NULL
@@ -146,6 +178,7 @@ function _batchreminders_build_allocation(array $blockedScheduleIds): array {
 		$schedules[] = [
 			'id'		=> (int) $dao->id,
 			'day'		=> _batchreminders_id_to_day((int) $dao->oldest_id, $history, $today),
+			'urg'		=> _batchreminders_urgency_bucket($dao->start_action_unit ?: NULL, $dao->start_action_offset === NULL ? NULL : (int) $dao->start_action_offset),
 			'leid'		=> $class['leid'],
 			'camp'		=> $class['camp'],
 			'pending'	=> (int) $dao->pending,
