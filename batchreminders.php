@@ -57,18 +57,21 @@ function _batchreminders_classify_title(string $title): array {
 }
 
 /**
- * Deelt een schedule in een urgentie-emmer in op basis van zijn vooruitloop
- * (start_action_offset + unit): hoe korter de lont, hoe sneller de inhoud
- * veroudert, hoe urgenter. Grove emmers (geen exacte offset-volgorde) zodat
- * een triviaal verschil (5 vs 7 dagen) de kampvolgorde niet overruled —
- * zelfde redenering als dag-niveau i.p.v. uur-niveau bij de wachttijd.
+ * Deelt een schedule in een chronologie-emmer in op basis van zijn vooruitloop
+ * (start_action_offset + unit). De mailreeks per kamp is een lopend verhaal
+ * (28wk → 4wk info → 1wk → 2dgn → 1dag): bij een achterstand moeten mails in
+ * die VERHAALVOLGORDE aankomen, dus de mail met de langste vooruitloop (die
+ * chronologisch het eerst in de reeks thuishoort) gaat vóór. Grove emmers
+ * (geen exacte offset-volgorde) zodat een triviaal verschil (5 vs 7 dagen)
+ * de kampvolgorde niet overruled — zelfde redenering als dag-niveau i.p.v.
+ * uur-niveau bij de wachttijd.
  *
  * In de praktijk (peiling 2-jul-2026): hour 30-36, day 0-7, week 1-28.
  *
  * @param  string|null $unit    hour/day/week (NULL bij absolute_date-schedules).
  * @param  int|null    $offset  Vooruitloop in $unit-eenheden.
- * @return int  1 = spoed (<= 2 dagen), 2 = normaal (<= 2 weken, ook absolute
- *              datum: bewust op die dag gepland), 3 = rustig (> 2 weken).
+ * @return int  1 = vroeg in de reeks (> 2 weken vooruitloop), 2 = midden
+ *              (<= 2 weken, ook absolute datum), 3 = laat in de reeks (<= 2 dagen).
  */
 function _batchreminders_urgency_bucket(?string $unit, ?int $offset): int {
 	if ($offset === NULL || $unit === NULL) {
@@ -76,10 +79,10 @@ function _batchreminders_urgency_bucket(?string $unit, ?int $offset): int {
 	}
 	$perUnit	= ['hour' => 1 / 24, 'day' => 1, 'week' => 7, 'month' => 30];
 	$dagen		= $offset * ($perUnit[strtolower($unit)] ?? 1);
-	if ($dagen <= 2) {
+	if ($dagen > 14) {
 		return 1;
 	}
-	return $dagen <= 14 ? 2 : 3;
+	return $dagen > 2 ? 2 : 3;
 }
 
 /**
@@ -108,9 +111,9 @@ function _batchreminders_id_to_day(int $id, array $history, string $fallback): s
  *
  * Prioriteit (voorkeur Richard, 2-jul-2026):
  *   1. oudste wachtende dag eerst (dag-niveau, niet uur-niveau)
- *   2. urgentie-emmer van het reminder-type: kortste vooruitloop eerst
- *      (spoed <= 2 dgn, normaal <= 2 wkn, rustig > 2 wkn) — een NA1DAG-mail
- *      gaat zo vóór een 4WEKEN-infomail, ongeacht kamp
+ *   2. chronologie-emmer van het reminder-type: LANGSTE vooruitloop eerst
+ *      (>2wkn, dan <=2wkn, dan <=2dgn) — de mailreeks is een lopend verhaal,
+ *      dus een 4WEKEN-infomail gaat vóór een NA1DAG-mail, ongeacht kamp
  *   3. binnen gelijke urgentie: deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
  *   4. daarna pas de leiding-templates (binnen hun dag+urgentie-emmer)
  * Het budget wordt greedy uitgedeeld in die volgorde: het hoogst geprioriteerde

@@ -64,50 +64,51 @@ class Batchreminders_RenderBudgetTest extends \PHPUnit\Framework\TestCase {
   }
 
   // ########################################################################
-  // ### 2b. URGENTIE-EMMERS (vooruitloop van het reminder-type)
+  // ### 2b. CHRONOLOGIE-EMMERS (verhaalvolgorde van de mailreeks)
   // ########################################################################
 
-  public function testUrgencyBucket_Spoed(): void {
-    $this->assertEquals(1, _batchreminders_urgency_bucket('hour', 30), '30 uur = spoed');
-    $this->assertEquals(1, _batchreminders_urgency_bucket('day', 1),   '1 dag = spoed');
-    $this->assertEquals(1, _batchreminders_urgency_bucket('day', 0),   'zelfde dag = spoed');
+  public function testChronoBucket_VroegInDeReeks(): void {
+    // Langste vooruitloop = chronologisch eerste mail van de reeks
+    $this->assertEquals(1, _batchreminders_urgency_bucket('week', 4),  '4WEKEN-info = vroeg in de reeks');
+    $this->assertEquals(1, _batchreminders_urgency_bucket('week', 28), '28 weken = vroeg in de reeks');
   }
 
-  public function testUrgencyBucket_Normaal(): void {
+  public function testChronoBucket_Midden(): void {
     $this->assertEquals(2, _batchreminders_urgency_bucket('day', 5));
     $this->assertEquals(2, _batchreminders_urgency_bucket('day', 7));
     $this->assertEquals(2, _batchreminders_urgency_bucket('week', 1));
     $this->assertEquals(2, _batchreminders_urgency_bucket('week', 2));
-    $this->assertEquals(2, _batchreminders_urgency_bucket(NULL, NULL), 'absolute-datum schedules = normaal');
+    $this->assertEquals(2, _batchreminders_urgency_bucket(NULL, NULL), 'absolute-datum schedules = midden');
   }
 
-  public function testUrgencyBucket_Rustig(): void {
-    $this->assertEquals(3, _batchreminders_urgency_bucket('week', 4),  '4WEKEN-info = rustig');
-    $this->assertEquals(3, _batchreminders_urgency_bucket('week', 28), '28 weken = rustig');
+  public function testChronoBucket_LaatInDeReeks(): void {
+    $this->assertEquals(3, _batchreminders_urgency_bucket('hour', 30), '30 uur = laat in de reeks');
+    $this->assertEquals(3, _batchreminders_urgency_bucket('day', 1),   '1 dag = laat in de reeks');
+    $this->assertEquals(3, _batchreminders_urgency_bucket('day', 0),   'zelfde dag = laat in de reeks');
   }
 
-  public function testUrgentieWintVanKamp_BinnenZelfdeDag(): void {
-    // NA1DAG voor JK (spoed) gaat vóór 4WEKEN voor KK (rustig)
+  public function testChronologie_4WekenGaatVoorNA1DAG_OngeachtKamp(): void {
+    // De mailreeks is een lopend verhaal: 4WEKEN KK vóór NA1DAG JK
     $alloc = _batchreminders_rank_and_allocate([
-      $this->sched(144, '2026-07-02', FALSE, 1, 100, 3),   // 4WEKEN KK, rustig
-      $this->sched(42,  '2026-07-02', FALSE, 4, 8,   1),   // NA1DAG JK, spoed
-    ], 25);
-    $this->assertEquals([42 => 8, 144 => 17], $alloc);
-  }
-
-  public function testOudereDag_WintVanUrgentie(): void {
-    // Dag blijft primair: rustige 4WEKEN van gisteren vóór spoed-NA1DAG van vandaag
-    $alloc = _batchreminders_rank_and_allocate([
-      $this->sched(42,  '2026-07-02', FALSE, 1, 8,  1),
-      $this->sched(144, '2026-07-01', FALSE, 1, 30, 3),
+      $this->sched(42,  '2026-07-02', FALSE, 4, 8,   3),   // NA1DAG JK, laat in reeks
+      $this->sched(144, '2026-07-02', FALSE, 1, 100, 1),   // 4WEKEN KK, vroeg in reeks
     ], 25);
     $this->assertEquals([144 => 25], $alloc);
   }
 
-  public function testGelijkeUrgentie_KampvolgordeBeslist(): void {
+  public function testOudereDag_WintVanChronologie(): void {
+    // Dag blijft primair: NA1DAG van gisteren vóór 4WEKEN van vandaag
     $alloc = _batchreminders_rank_and_allocate([
-      $this->sched(149, '2026-07-02', FALSE, 3, 20, 3),    // TK, rustig
-      $this->sched(144, '2026-07-02', FALSE, 1, 20, 3),    // KK, rustig
+      $this->sched(144, '2026-07-02', FALSE, 1, 30, 1),
+      $this->sched(42,  '2026-07-01', FALSE, 4, 8,  3),
+    ], 25);
+    $this->assertEquals([42 => 8, 144 => 17], $alloc);
+  }
+
+  public function testGelijkeChronologie_KampvolgordeBeslist(): void {
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(149, '2026-07-02', FALSE, 3, 20, 1),    // TK, vroeg in reeks
+      $this->sched(144, '2026-07-02', FALSE, 1, 20, 1),    // KK, vroeg in reeks
     ], 25);
     $this->assertEquals([144 => 20, 149 => 5], $alloc);
   }
