@@ -35,7 +35,12 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 	static $totalRemaining		= 0;
 	static $blockedScheduleIds	= [];    // action_schedule_ids waarvan de template validatie faalde
 
-	$batchLimit				= 25;
+	// 2-jul-2026: verlaagd van 25 naar 5. Kleine batches houden elke cron-run kort,
+	// zodat de wrapper-timeout (cron-civicrm-reminders.sh) strak kan staan en een
+	// vastgelopen run (kapotte DB-connectie die per schedule blijft doorploegen)
+	// snel wordt afgebroken i.p.v. een uur CPU te verbranden. Bij een gezonde
+	// keten mag dit later weer omhoog — timeout dan evenredig meeverhogen.
+	$batchLimit				= 5;
 	$extdebug 				= 'batchreminders';
 
 	// Bescherming: Limiteer alleen automatische achtergrondprocessen (cli/cron)
