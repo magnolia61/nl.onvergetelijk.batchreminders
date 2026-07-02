@@ -4,6 +4,88 @@
 if (!defined('CIVICRM_SYSTEM')) { return; }
 
 /**
+ * Implements hook_civicrm_config().
+ *
+ * Registreert de render-limiter: een listener op civi.actionSchedule.prepareMailingQuery
+ * die een LIMIT op de wachtrij-query van elk schedule zet. Zonder deze limiet rendert
+ * CiviCRM core per schedule ALLE wachtende ontvangers (TokenProcessor->evaluate() over
+ * de volledige set — bv. 126 × het zware Smarty-headerwerk = minuten CPU) vóórdat de
+ * eerste mail verstuurd wordt; de alterMailParams-cap hieronder knijpt pas dáárna af,
+ * waardoor al dat renderwerk werd weggegooid en elke run opnieuw begon.
+ */
+function batchreminders_civicrm_config(&$config) {
+	static $registered = FALSE;
+	if ($registered) {
+		return;
+	}
+	$registered = TRUE;
+
+	Civi::dispatcher()->addListener('civi.actionSchedule.prepareMailingQuery', '_batchreminders_limit_mailing_query');
+}
+
+/**
+ * De gedeelde batchgrootte: één knop voor render-limiet én verzend-vangnet.
+ * Instelbaar via Civi::settings() (settings/Batchreminders.setting.php), default 25.
+ */
+function _batchreminders_batchsize(): int {
+	$size = (int) (Civi::settings()->get('batchreminders_batchsize') ?: 25);
+	return max(1, $size);
+}
+
+/**
+ * Puur rekenwerk voor het render-budget van één schedule-query — losgetrokken
+ * zodat de tests dit zonder Civi-bootstrap kunnen verifiëren.
+ *
+ * @param  int  $batchsize  Totaalbudget voor deze cron-run.
+ * @param  int  $granted    Al uitgedeeld budget aan eerdere schedules in deze run.
+ * @param  bool $isBlocked  TRUE als de template-validatie van dit schedule faalde.
+ * @return int  Aantal ontvangers dat dit schedule mag renderen (0 = niets ophalen).
+ */
+function _batchreminders_render_budget(int $batchsize, int $granted, bool $isBlocked): int {
+	if ($isBlocked) {
+		return 0;
+	}
+	return max(0, $batchsize - $granted);
+}
+
+/**
+ * Listener: civi.actionSchedule.prepareMailingQuery.
+ *
+ * Zet een LIMIT op de wachtrij-query van het schedule, zodat core nooit meer
+ * ontvangers ophaalt (en dus rendert) dan het run-budget toestaat. Rijen die
+ * buiten de LIMIT vallen behouden action_date_time = NULL in civicrm_action_log
+ * en komen automatisch in de volgende cron-run aan de beurt.
+ *
+ * Budget-boekhouding loopt via Civi::$statics zodat de alterMailParams-hook
+ * (zelfde proces) en deze listener dezelfde run-status delen. We tellen het
+ * UITGEDEELDE budget (granted), niet het verzonden aantal: ook als een verzending
+ * faalt is het renderwerk al gedaan, dus het budget is verbruikt.
+ *
+ * Geblokkeerde schedules (template-validatie gefaald, zie prewarm) krijgen LIMIT 0:
+ * die worden dan niet eens meer gerenderd — voorheen werd er volledig gerenderd en
+ * pas bij verzending geaborteerd.
+ */
+function _batchreminders_limit_mailing_query($event) {
+	// Zelfde scope als de alterMailParams-hook: alleen cli/cron begrenzen.
+	if (php_sapi_name() !== 'cli') {
+		return;
+	}
+
+	$state = &Civi::$statics['batchreminders'];
+	$state['granted']	= $state['granted'] ?? 0;
+	$state['blocked']	= $state['blocked'] ?? _batchreminders_load_blocked_schedules();
+
+	$scheduleId	= (int) ($event->actionSchedule->id ?? 0);
+	$isBlocked	= in_array($scheduleId, $state['blocked'], TRUE);
+	$budget		= _batchreminders_render_budget(_batchreminders_batchsize(), $state['granted'], $isBlocked);
+
+	$event->query->limit($budget);
+	$state['granted'] += $budget;
+
+	Civi::log()->debug("batchreminders: render-limiet schedule {$scheduleId}: LIMIT {$budget}" . ($isBlocked ? ' (geblokkeerd door validatie)' : '') . " — totaal uitgedeeld: {$state['granted']}.");
+}
+
+/**
  * Implements hook_civicrm_alterMailParams().
  *
  * Deze hook wordt door CiviCRM aangeroepen vlak voordat een e-mail
@@ -35,12 +117,12 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 	static $totalRemaining		= 0;
 	static $blockedScheduleIds	= [];    // action_schedule_ids waarvan de template validatie faalde
 
-	// 2-jul-2026: verlaagd van 25 naar 5. Kleine batches houden elke cron-run kort,
-	// zodat de wrapper-timeout (cron-civicrm-reminders.sh) strak kan staan en een
-	// vastgelopen run (kapotte DB-connectie die per schedule blijft doorploegen)
-	// snel wordt afgebroken i.p.v. een uur CPU te verbranden. Bij een gezonde
-	// keten mag dit later weer omhoog — timeout dan evenredig meeverhogen.
-	$batchLimit				= 5;
+	// De primaire begrenzing zit sinds 2-jul-2026 in de render-limiter
+	// (_batchreminders_limit_mailing_query, LIMIT op de wachtrij-query) — deze
+	// per-mail teller is het VANGNET met dezelfde batchgrootte, voor het geval
+	// de listener ooit niet vuurt. Eén gedeelde setting zodat render- en
+	// verzendlimiet nooit uit elkaar kunnen lopen.
+	$batchLimit				= _batchreminders_batchsize();
 	$extdebug 				= 'batchreminders';
 
 	// Bescherming: Limiteer alleen automatische achtergrondprocessen (cli/cron)
