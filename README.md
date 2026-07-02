@@ -84,8 +84,12 @@ eigen cron. Resultaat gaat via een atomisch geschreven state-file
 (`/tmp/batchreminders_blocked_schedules.json`) naar de hooks. Geblokkeerde
 schedules krijgen `LIMIT 0` — die worden dus niet eens gerenderd.
 
-**Fail-open**: geen/corrupte/verouderde state ⇒ niets wordt geblokkeerd (wel
-gelogd). Liever een kapotte template versturen dan de keten stilleggen.
+**Fail-open** bij ontbrekende of corrupte state: niets wordt geblokkeerd (wel
+gelogd) — liever een kapotte template versturen dan de keten stilleggen. Bij
+een **verouderde** state (prewarm-cron lijkt gestopt, > 20 min oud) geldt het
+omgekeerde: de laatst bekende blocked-lijst blijft juist actief (wel gelogd
+als error) — beter een oude blokkade aanhouden dan bij een gestopte prewarm
+blind alles doorlaten.
 
 ### 5. Vangrails (defense in depth)
 
