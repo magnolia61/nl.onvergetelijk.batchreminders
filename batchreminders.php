@@ -33,25 +33,126 @@ function _batchreminders_batchsize(): int {
 }
 
 /**
- * Puur rekenwerk voor het render-budget van één schedule-query — losgetrokken
- * zodat de tests dit zonder Civi-bootstrap kunnen verifiëren.
+ * Classificeert een schedule-titel voor de verzendprioriteit.
  *
- * Het budget wordt begrensd op het WERKELIJKE aantal wachtenden van dit schedule:
- * zonder die begrenzing claimde het eerst-verwerkte schedule altijd het volle
- * run-budget via zijn LIMIT — ook met 0 wachtenden — waardoor latere schedules
- * met een echte wachtrij LIMIT 0 kregen en de run niets meer verzond.
+ * Kamp wordt herkend aan KK/BK/TK/JK/TOP in de titel (bv. "07_JD_4WEKEN_INFO_KK1").
+ * Leiding-templates herkennen we aan het JL-segment of LEID in de titel
+ * (bv. "17_JL_1WEEK_LEID_WK1") — die komen ná alle deelnemer-templates.
  *
- * @param  int  $batchsize  Totaalbudget voor deze cron-run.
- * @param  int  $granted    Al uitgedeeld budget aan eerdere schedules in deze run.
- * @param  bool $isBlocked  TRUE als de template-validatie van dit schedule faalde.
- * @param  int  $pending    Werkelijk aantal wachtenden (NULL-rijen) van dit schedule.
- * @return int  Aantal ontvangers dat dit schedule mag renderen (0 = niets ophalen).
+ * @return array{leid: bool, camp: int}  camp: KK=1 BK=2 TK=3 JK=4 TOP=5, onbekend=6
  */
-function _batchreminders_render_budget(int $batchsize, int $granted, bool $isBlocked, int $pending): int {
-	if ($isBlocked) {
-		return 0;
+function _batchreminders_classify_title(string $title): array {
+	$isLeid	= (bool) preg_match('/(^|_)JL(_|$)|LEID/i', $title);
+	$camp	= 6;
+	// Simpele substring-match in prioriteitsvolgorde: dekt zowel losse kampen (KK1)
+	// als samengestelde reminders (KKBKTKJK → telt als KK, het hoogst geprioriteerde
+	// kamp in de set). Woordgrenzen werken hier niet door die samenstellingen.
+	foreach (['KK' => 1, 'BK' => 2, 'TK' => 3, 'JK' => 4, 'TOP' => 5] as $kamp => $prio) {
+		if (stripos($title, $kamp) !== FALSE) {
+			$camp = $prio;
+			break;
+		}
 	}
-	return max(0, min($batchsize - $granted, $pending));
+	return ['leid' => $isLeid, 'camp' => $camp];
+}
+
+/**
+ * Herleidt de (dag)datum waarop een action_log-rij is aangemaakt uit de
+ * nullfix-snapshothistorie (/tmp/nullfix_max_id.history: per run "epoch max_id").
+ * action_log heeft zelf geen aanmaakdatum-kolom; de vroegste snapshot waarvan de
+ * max-id >= deze rij-id is, geeft de bovengrens van de aanmaakdag (±30 min).
+ *
+ * @param  int    $id        action_log-id van de oudste wachtende rij.
+ * @param  array  $history   [[epoch, maxid], ...] (hoeft niet gesorteerd te zijn).
+ * @param  string $fallback  Dag (Y-m-d) als de historie geen antwoord heeft.
+ */
+function _batchreminders_id_to_day(int $id, array $history, string $fallback): string {
+	$best = NULL;
+	foreach ($history as $snap) {
+		[$epoch, $maxid] = $snap;
+		if ($maxid >= $id && ($best === NULL || $epoch < $best)) {
+			$best = $epoch;
+		}
+	}
+	return $best === NULL ? $fallback : date('Y-m-d', $best);
+}
+
+/**
+ * Rangschikt schedules en verdeelt het run-budget — puur rekenwerk, testbaar.
+ *
+ * Prioriteit (voorkeur Richard, 2-jul-2026):
+ *   1. oudste wachtende dag eerst (dag-niveau, niet uur-niveau)
+ *   2. binnen een dag: deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
+ *   3. daarna pas de leiding-templates
+ * Het budget wordt greedy uitgedeeld in die volgorde: het hoogst geprioriteerde
+ * schedule wordt volledig bediend vóór het volgende aan de beurt komt.
+ *
+ * @param  array $schedules  Per schedule: ['id'=>int,'day'=>'Y-m-d','leid'=>bool,'camp'=>int,'pending'=>int]
+ * @param  int   $batchsize  Totaalbudget voor deze run.
+ * @return array  schedule_id => toegekend budget (alleen schedules met budget > 0).
+ */
+function _batchreminders_rank_and_allocate(array $schedules, int $batchsize): array {
+	usort($schedules, function($a, $b) {
+		return [$a['day'], (int) $a['leid'], $a['camp'], $a['id']]
+		   <=> [$b['day'], (int) $b['leid'], $b['camp'], $b['id']];
+	});
+
+	$alloc		= [];
+	$remaining	= $batchsize;
+	foreach ($schedules as $s) {
+		if ($remaining <= 0) {
+			break;
+		}
+		$give = min($remaining, max(0, (int) $s['pending']));
+		if ($give > 0) {
+			$alloc[$s['id']]	= $give;
+			$remaining			-= $give;
+		}
+	}
+	return $alloc;
+}
+
+/**
+ * Bouwt de budgetverdeling voor deze cron-run: alle schedules met wachtenden
+ * ophalen, classificeren (kamp/leiding + oudste-dag via de nullfix-historie)
+ * en het budget verdelen volgens _batchreminders_rank_and_allocate().
+ */
+function _batchreminders_build_allocation(array $blockedScheduleIds): array {
+	$dao = CRM_Core_DAO::executeQuery("
+		SELECT S.id, S.title, COUNT(L.id) AS pending, MIN(L.id) AS oldest_id
+		FROM   civicrm_action_log      L
+		JOIN   civicrm_action_schedule S ON S.id = L.action_schedule_id
+		WHERE  L.action_date_time IS NULL
+		AND    S.is_active        = 1
+		GROUP  BY S.id
+	");
+
+	// Snapshothistorie van de nullfix-cron inlezen voor de dag-herleiding.
+	$history = [];
+	foreach (@file('/tmp/nullfix_max_id.history', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+		$parts = preg_split('/\s+/', trim($line));
+		if (count($parts) === 2 && ctype_digit($parts[0]) && ctype_digit($parts[1])) {
+			$history[] = [(int) $parts[0], (int) $parts[1]];
+		}
+	}
+	$today = date('Y-m-d');
+
+	$schedules = [];
+	while ($dao->fetch()) {
+		if (in_array((int) $dao->id, $blockedScheduleIds, TRUE)) {
+			continue; // validatie gefaald: geen budget, wordt ook niet gerenderd
+		}
+		$class = _batchreminders_classify_title((string) $dao->title);
+		$schedules[] = [
+			'id'		=> (int) $dao->id,
+			'day'		=> _batchreminders_id_to_day((int) $dao->oldest_id, $history, $today),
+			'leid'		=> $class['leid'],
+			'camp'		=> $class['camp'],
+			'pending'	=> (int) $dao->pending,
+		];
+	}
+
+	return _batchreminders_rank_and_allocate($schedules, _batchreminders_batchsize());
 }
 
 /**
@@ -78,33 +179,28 @@ function _batchreminders_limit_mailing_query($event) {
 	}
 
 	$state = &Civi::$statics['batchreminders'];
-	$state['granted']	= $state['granted'] ?? 0;
 	$state['blocked']	= $state['blocked'] ?? _batchreminders_load_blocked_schedules();
+
+	// Eénmalig per run: prioriteitsranking + budgetverdeling opbouwen.
+	// Kanttekening: de verdeling is een snapshot van vóór core's recipient-INSERTs;
+	// rijen die core tijdens deze run nog toevoegt komen de volgende run aan de beurt.
+	if (!isset($state['alloc'])) {
+		$state['alloc'] = _batchreminders_build_allocation($state['blocked']);
+		if (!empty($state['alloc'])) {
+			Civi::log()->debug("batchreminders: budgetverdeling deze run (dag → kamp KK/BK/TK/JK/TOP → leiding): " . json_encode($state['alloc']));
+		}
+	}
 
 	$scheduleId	= (int) ($event->actionSchedule->id ?? 0);
 	$isBlocked	= in_array($scheduleId, $state['blocked'], TRUE);
-
-	// Werkelijk aantal wachtenden van dít schedule (goedkope indexed COUNT).
-	// Core heeft op dit punt de recipient-INSERTs voor dit schedule al gedaan,
-	// dus de telling is actueel. Zonder deze telling zou het eerst-verwerkte
-	// schedule het volledige budget claimen, ook met 0 wachtenden.
-	$pending	= 0;
-	if (!$isBlocked && $state['granted'] < _batchreminders_batchsize()) {
-		$pending = (int) CRM_Core_DAO::singleValueQuery(
-			"SELECT COUNT(*) FROM civicrm_action_log WHERE action_schedule_id = %1 AND action_date_time IS NULL",
-			[1 => [$scheduleId, 'Integer']]
-		);
-	}
-
-	$budget		= _batchreminders_render_budget(_batchreminders_batchsize(), $state['granted'], $isBlocked, $pending);
+	$budget		= $isBlocked ? 0 : (int) ($state['alloc'][$scheduleId] ?? 0);
 
 	$event->query->limit($budget);
-	$state['granted'] += $budget;
 
 	// Alleen loggen als er iets te melden valt (budget > 0 of geblokkeerd) — LIMIT 0
-	// voor een leeg schedule is de norm en zou de log met ~100 regels/run vervuilen.
+	// voor een leeg/niet-geprioriteerd schedule is de norm.
 	if ($budget > 0 || $isBlocked) {
-		Civi::log()->debug("batchreminders: render-limiet schedule {$scheduleId}: LIMIT {$budget} (wachtend: {$pending})" . ($isBlocked ? ' (geblokkeerd door validatie)' : '') . " — totaal uitgedeeld: {$state['granted']}.");
+		Civi::log()->debug("batchreminders: render-limiet schedule {$scheduleId}: LIMIT {$budget}" . ($isBlocked ? ' (geblokkeerd door validatie)' : ''));
 	}
 }
 

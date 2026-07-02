@@ -1,11 +1,11 @@
 <?php
 
 /**
- * Unit tests voor _batchreminders_render_budget().
+ * Unit tests voor de prioriteits- en budgetverdeling van de render-limiter.
  *
- * Puur rekenwerk (geen Civi-bootstrap): verifieert dat het run-budget correct
- * over opeenvolgende schedule-queries wordt verdeeld, begrensd op het werkelijke
- * aantal wachtenden per schedule, en dat geblokkeerde schedules altijd 0 krijgen.
+ * Puur rekenwerk (geen Civi-bootstrap): titel-classificatie, dag-herleiding uit
+ * de nullfix-snapshothistorie, en de greedy budgetverdeling volgens de
+ * verzendprioriteit: dag (oudste eerst) → kamp KK/BK/TK/JK/TOP → leiding laatst.
  *
  * @group headless
  */
@@ -18,87 +18,122 @@ class Batchreminders_RenderBudgetTest extends \PHPUnit\Framework\TestCase {
     require_once __DIR__ . '/../../../batchreminders.php';
   }
 
-  // ########################################################################
-  // ### 1. EERSTE SCHEDULE KRIJGT MAX ZIJN EIGEN WACHTRIJ
-  // ########################################################################
-
-  public function testEersteSchedule_MetGroteWachtrij_KrijgtVolleBudget(): void {
-    $this->assertEquals(25, _batchreminders_render_budget(25, 0, FALSE, 126));
-  }
-
-  public function testEersteSchedule_MetKleineWachtrij_KrijgtAlleenWatNodig(): void {
-    // Schedule heeft maar 3 wachtenden → claimt 3, niet 25.
-    // (De bug die dit afdekt: schedule 23 claimde het volle budget met 0 wachtenden,
-    // waardoor schedules 144-151 met een echte wachtrij LIMIT 0 kregen.)
-    $this->assertEquals(3, _batchreminders_render_budget(25, 0, FALSE, 3));
-  }
-
-  public function testEersteSchedule_ZonderWachtenden_KrijgtNul(): void {
-    $this->assertEquals(0, _batchreminders_render_budget(25, 0, FALSE, 0));
+  /**
+   * Bouwt een schedule-regel voor de allocator.
+   */
+  private function sched(int $id, string $day, bool $leid, int $camp, int $pending): array {
+    return ['id' => $id, 'day' => $day, 'leid' => $leid, 'camp' => $camp, 'pending' => $pending];
   }
 
   // ########################################################################
-  // ### 2. VOLGENDE SCHEDULES KRIJGEN DE REST
+  // ### 1. TITEL-CLASSIFICATIE (kamp + deelnemer/leiding)
   // ########################################################################
 
-  public function testTweedeSchedule_KrijgtRestbudget(): void {
-    // Schedule 1 verbruikte al 25 → schedule 2 krijgt niets meer
-    $this->assertEquals(0, _batchreminders_render_budget(25, 25, FALSE, 104));
+  public function testClassificatie_DeelnemerKampen(): void {
+    $this->assertEquals(['leid' => FALSE, 'camp' => 1], _batchreminders_classify_title('07_JD_4WEKEN_INFO_KK1'));
+    $this->assertEquals(['leid' => FALSE, 'camp' => 2], _batchreminders_classify_title('07_JD_4WEKEN_INFO_BK2'));
+    $this->assertEquals(['leid' => FALSE, 'camp' => 3], _batchreminders_classify_title('07_JD_4WEKEN_INFO_TK1'));
+    $this->assertEquals(['leid' => FALSE, 'camp' => 4], _batchreminders_classify_title('07_JD_4WEKEN_INFO_JK2'));
   }
 
-  public function testGedeeltelijkVerbruikt_KrijgtVerschil(): void {
-    // Schedule 1 claimde 10 (had 10 wachtenden) → schedule 2 mag nog 15
-    $this->assertEquals(15, _batchreminders_render_budget(25, 10, FALSE, 104));
+  public function testClassificatie_Leiding(): void {
+    $this->assertTrue(_batchreminders_classify_title('17_JL_1WEEK_LEID_WK1')['leid']);
+    $this->assertTrue(_batchreminders_classify_title('05_JL_MAIL1MEI_TIPS_LEID')['leid']);
+    $this->assertFalse(_batchreminders_classify_title('01_JD_NA1WEEK_VOORLOPIG_KKBKTKJK')['leid']);
   }
 
-  // ########################################################################
-  // ### 3. GEBLOKKEERD SCHEDULE KRIJGT ALTIJD 0
-  // ########################################################################
-
-  public function testGeblokkeerdSchedule_KrijgtNul(): void {
-    $this->assertEquals(0, _batchreminders_render_budget(25, 0, TRUE, 126));
-  }
-
-  public function testGeblokkeerd_VerbruiktGeenBudget(): void {
-    // Geblokkeerd schedule kreeg 0 → volgend gezond schedule heeft nog alles
-    $granted = 0;
-    $granted += _batchreminders_render_budget(25, $granted, TRUE, 126);   // geblokkeerd: +0
-    $this->assertEquals(25, _batchreminders_render_budget(25, $granted, FALSE, 104));
+  public function testClassificatie_GecombineerdeTitelPaktEersteKamp(): void {
+    // KKBKTKJK-brede reminders matchen als KK (hoogste prioriteit van de set)
+    $this->assertEquals(1, _batchreminders_classify_title('05_JD_MAIL1MEI_TIPS_KKBKTKJK')['camp']);
   }
 
   // ########################################################################
-  // ### 4. BUDGET KAN NIET NEGATIEF
+  // ### 2. DAG-HERLEIDING UIT SNAPSHOTHISTORIE
   // ########################################################################
 
-  public function testOverbesteed_GeeftNulNietNegatief(): void {
-    $this->assertEquals(0, _batchreminders_render_budget(25, 30, FALSE, 104));
+  public function testIdToDay_VindtVroegsteSnapshotDieDeRijKende(): void {
+    $d1 = strtotime('2026-06-30 12:00');
+    $d2 = strtotime('2026-07-01 12:00');
+    $history = [[$d2, 5000], [$d1, 1000]];   // bewust ongesorteerd
+    $this->assertEquals('2026-06-30', _batchreminders_id_to_day(900,  $history, '2026-07-02'));
+    $this->assertEquals('2026-07-01', _batchreminders_id_to_day(3000, $history, '2026-07-02'));
+  }
+
+  public function testIdToDay_ZonderHistorieValtTerugOpVandaag(): void {
+    $this->assertEquals('2026-07-02', _batchreminders_id_to_day(999999, [], '2026-07-02'));
   }
 
   // ########################################################################
-  // ### 5. REALISTISCH SCENARIO: leeg schedule eerst, dan volle wachtrij
+  // ### 3. PRIORITEIT: DAG WINT VAN KAMP, KAMP WINT VAN ID
   // ########################################################################
 
-  public function testLeegScheduleEerst_BudgetGaatNaarVolleSchedules(): void {
-    // Nabootsing van de echte situatie op 2-jul-2026: schedule 23 (0 wachtend)
-    // wordt vóór 144 (126 wachtend) verwerkt. Budget moet bij 144 landen.
-    $granted = 0;
-    $granted += _batchreminders_render_budget(25, $granted, FALSE, 0);     // schedule 23: +0
-    $b144 = _batchreminders_render_budget(25, $granted, FALSE, 126);
-    $this->assertEquals(25, $b144, 'Schedule 144 krijgt het volle budget');
-    $granted += $b144;
-    $this->assertEquals(0, _batchreminders_render_budget(25, $granted, FALSE, 104), 'Schedule 145 moet wachten op volgende run');
+  public function testOudereDag_WintVanKampvolgorde(): void {
+    // JK van gisteren gaat vóór KK van vandaag
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(144, '2026-07-02', FALSE, 1, 100),   // KK, vandaag
+      $this->sched(151, '2026-07-01', FALSE, 4, 10),    // JK, gisteren
+    ], 25);
+    $this->assertEquals([151 => 10, 144 => 15], $alloc);
   }
 
-  public function testMeerdereKleineSchedules_TotaalMaxBatchsize(): void {
-    // 8 schedules met elk 10 wachtenden, budget 25 → 10 + 10 + 5 + 0×5
-    $granted = 0;
-    $per = [];
+  public function testBinnenZelfdeDag_KampvolgordeBeslist(): void {
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(150, '2026-07-02', FALSE, 4, 50),    // JK
+      $this->sched(146, '2026-07-02', FALSE, 2, 50),    // BK
+      $this->sched(144, '2026-07-02', FALSE, 1, 10),    // KK
+    ], 25);
+    // KK eerst (10), dan BK (15); JK moet wachten
+    $this->assertEquals([144 => 10, 146 => 15], $alloc);
+  }
+
+  public function testLeiding_KomtNaAlleDeelnemers(): void {
+    // Leiding-KK van vandaag komt NA deelnemer-JK van vandaag
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(55,  '2026-07-02', TRUE,  1, 30),    // leiding
+      $this->sched(150, '2026-07-02', FALSE, 4, 20),    // deelnemer JK
+    ], 25);
+    $this->assertEquals([150 => 20, 55 => 5], $alloc);
+  }
+
+  public function testOudereLeiding_WintVanNieuwereDeelnemer(): void {
+    // Dag blijft primair: leiding van gisteren gaat vóór deelnemer van vandaag
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(144, '2026-07-02', FALSE, 1, 100),
+      $this->sched(55,  '2026-07-01', TRUE,  6, 5),
+    ], 25);
+    $this->assertEquals([55 => 5, 144 => 20], $alloc);
+  }
+
+  // ########################################################################
+  // ### 4. BUDGETVERDELING BLIJFT CORRECT
+  // ########################################################################
+
+  public function testTotaalNooitBovenBatchsize(): void {
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(144, '2026-07-02', FALSE, 1, 126),
+      $this->sched(145, '2026-07-02', FALSE, 1, 104),
+      $this->sched(146, '2026-07-02', FALSE, 2, 44),
+    ], 25);
+    $this->assertEquals(25, array_sum($alloc));
+    $this->assertEquals([144 => 25], $alloc, 'Grootste-prioriteit schedule wordt eerst volledig bediend');
+  }
+
+  public function testLegeSchedules_KrijgenNiets(): void {
+    $alloc = _batchreminders_rank_and_allocate([
+      $this->sched(23,  '2026-07-02', FALSE, 6, 0),
+      $this->sched(144, '2026-07-02', FALSE, 1, 10),
+    ], 25);
+    $this->assertEquals([144 => 10], $alloc);
+    $this->assertArrayNotHasKey(23, $alloc);
+  }
+
+  public function testKleineWachtrijen_BudgetSchuiftDoor(): void {
+    // 8 schedules met elk 10 wachtenden, budget 25 → 10 + 10 + 5
+    $scheds = [];
     foreach (range(1, 8) as $i) {
-      $b = _batchreminders_render_budget(25, $granted, FALSE, 10);
-      $per[] = $b;
-      $granted += $b;
+      $scheds[] = $this->sched(100 + $i, '2026-07-02', FALSE, $i <= 5 ? $i : 6, 10);
     }
-    $this->assertEquals([10, 10, 5, 0, 0, 0, 0, 0], $per);
-    $this->assertEquals(25, $granted, 'Totaal uitgedeeld = exact batchsize');
+    $alloc = _batchreminders_rank_and_allocate($scheds, 25);
+    $this->assertEquals([101 => 10, 102 => 10, 103 => 5], $alloc);
   }
 }
