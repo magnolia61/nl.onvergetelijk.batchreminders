@@ -36,16 +36,22 @@ function _batchreminders_batchsize(): int {
  * Puur rekenwerk voor het render-budget van één schedule-query — losgetrokken
  * zodat de tests dit zonder Civi-bootstrap kunnen verifiëren.
  *
+ * Het budget wordt begrensd op het WERKELIJKE aantal wachtenden van dit schedule:
+ * zonder die begrenzing claimde het eerst-verwerkte schedule altijd het volle
+ * run-budget via zijn LIMIT — ook met 0 wachtenden — waardoor latere schedules
+ * met een echte wachtrij LIMIT 0 kregen en de run niets meer verzond.
+ *
  * @param  int  $batchsize  Totaalbudget voor deze cron-run.
  * @param  int  $granted    Al uitgedeeld budget aan eerdere schedules in deze run.
  * @param  bool $isBlocked  TRUE als de template-validatie van dit schedule faalde.
+ * @param  int  $pending    Werkelijk aantal wachtenden (NULL-rijen) van dit schedule.
  * @return int  Aantal ontvangers dat dit schedule mag renderen (0 = niets ophalen).
  */
-function _batchreminders_render_budget(int $batchsize, int $granted, bool $isBlocked): int {
+function _batchreminders_render_budget(int $batchsize, int $granted, bool $isBlocked, int $pending): int {
 	if ($isBlocked) {
 		return 0;
 	}
-	return max(0, $batchsize - $granted);
+	return max(0, min($batchsize - $granted, $pending));
 }
 
 /**
@@ -77,12 +83,29 @@ function _batchreminders_limit_mailing_query($event) {
 
 	$scheduleId	= (int) ($event->actionSchedule->id ?? 0);
 	$isBlocked	= in_array($scheduleId, $state['blocked'], TRUE);
-	$budget		= _batchreminders_render_budget(_batchreminders_batchsize(), $state['granted'], $isBlocked);
+
+	// Werkelijk aantal wachtenden van dít schedule (goedkope indexed COUNT).
+	// Core heeft op dit punt de recipient-INSERTs voor dit schedule al gedaan,
+	// dus de telling is actueel. Zonder deze telling zou het eerst-verwerkte
+	// schedule het volledige budget claimen, ook met 0 wachtenden.
+	$pending	= 0;
+	if (!$isBlocked && $state['granted'] < _batchreminders_batchsize()) {
+		$pending = (int) CRM_Core_DAO::singleValueQuery(
+			"SELECT COUNT(*) FROM civicrm_action_log WHERE action_schedule_id = %1 AND action_date_time IS NULL",
+			[1 => [$scheduleId, 'Integer']]
+		);
+	}
+
+	$budget		= _batchreminders_render_budget(_batchreminders_batchsize(), $state['granted'], $isBlocked, $pending);
 
 	$event->query->limit($budget);
 	$state['granted'] += $budget;
 
-	Civi::log()->debug("batchreminders: render-limiet schedule {$scheduleId}: LIMIT {$budget}" . ($isBlocked ? ' (geblokkeerd door validatie)' : '') . " — totaal uitgedeeld: {$state['granted']}.");
+	// Alleen loggen als er iets te melden valt (budget > 0 of geblokkeerd) — LIMIT 0
+	// voor een leeg schedule is de norm en zou de log met ~100 regels/run vervuilen.
+	if ($budget > 0 || $isBlocked) {
+		Civi::log()->debug("batchreminders: render-limiet schedule {$scheduleId}: LIMIT {$budget} (wachtend: {$pending})" . ($isBlocked ? ' (geblokkeerd door validatie)' : '') . " — totaal uitgedeeld: {$state['granted']}.");
+	}
 }
 
 /**
