@@ -24,6 +24,9 @@
     <ver>6.14</ver>
   </compatibility>
   <comments>Pure logging hook, de daadwerkelijke batch-limiet wordt door het externe bash-script afgehandeld.</comments>
+  <requires>
+    <ext>nl.onvergetelijk.base</ext>
+  </requires>
   <classloader>
     <psr0 prefix="CRM_" path="."/>
     <psr4 prefix="Civi\" path="Civi"/>
