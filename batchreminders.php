@@ -324,7 +324,7 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 	$isBlocked	= in_array($scheduleId, $blockedScheduleIds, TRUE);
 
 	if ($isBlocked || $sentCount >= $batchLimit) {
-		$params['abort']	= TRUE;
+		$params['abortMailSend']	= TRUE;
 
 		if (function_exists('wachthond')) {
 			$params_abort	= [
