@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<menu>
+  <item>
+    <path>civicrm/batchreminders/dashboard</path>
+    <page_callback>CRM_Batchreminders_Page_Dashboard</page_callback>
+    <title>Reminderqueue Dashboard</title>
+    <access_arguments>administer CiviCRM</access_arguments>
+  </item>
+</menu>

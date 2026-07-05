@@ -24,6 +24,91 @@ function batchreminders_civicrm_config(&$config) {
 }
 
 /**
+ * Implements hook_civicrm_xmlMenu().
+ *
+ * Registreert het dashboard op civicrm/batchreminders/dashboard (zie xml/Menu/batchreminders.xml
+ * en CRM/Batchreminders/Page/Dashboard.php).
+ */
+function batchreminders_civicrm_xmlMenu(&$files) {
+	$files[] = __DIR__ . '/xml/Menu/batchreminders.xml';
+}
+
+/**
+ * Implements hook_civicrm_navigationMenu().
+ *
+ * Voegt het dashboard toe onder Administer -> CiviMail (naast "CiviMail Component Settings"),
+ * zodat beheerders er ook zonder de directe URL bij kunnen.
+ */
+function batchreminders_civicrm_navigationMenu(&$nodes) {
+	$civiMailNode = &_batchreminders_find_navigation_node($nodes, 'CiviMail');
+	if ($civiMailNode === NULL) {
+		return; // geen "CiviMail"-menu gevonden — niets om aan toe te voegen
+	}
+
+	if (!isset($civiMailNode['child']) || !is_array($civiMailNode['child'])) {
+		$civiMailNode['child'] = [];
+	}
+
+	// Nieuwe navID die niet met bestaande IDs in de hele boom botst.
+	$newNavId = _batchreminders_max_navigation_id($nodes) + 1;
+
+	// Niet dubbel toevoegen als deze functie meermaals per request-cyclus aangeroepen wordt.
+	foreach ($civiMailNode['child'] as $child) {
+		if (($child['attributes']['name'] ?? '') === 'Reminderqueue Dashboard') {
+			return;
+		}
+	}
+
+	$civiMailNode['child'][$newNavId] = [
+		'attributes' => [
+			'label'        => 'Reminderqueue Dashboard',
+			'name'         => 'Reminderqueue Dashboard',
+			'url'          => 'civicrm/batchreminders/dashboard?reset=1',
+			'permission'   => 'administer CiviCRM',
+			'operator'     => NULL,
+			'separator'    => NULL,
+			'parentID'     => $civiMailNode['attributes']['navID'] ?? NULL,
+			'navID'        => $newNavId,
+			'active'       => 1,
+		],
+	];
+}
+
+/**
+ * Zoekt in de navigationMenu-boom (recursief) naar een node op naam. Retourneert een
+ * referentie zodat de caller direct in de boom kan schrijven (child toevoegen).
+ */
+function &_batchreminders_find_navigation_node(array &$nodes, string $name) {
+	foreach ($nodes as &$node) {
+		if (($node['attributes']['name'] ?? '') === $name) {
+			return $node;
+		}
+		if (isset($node['child']) && is_array($node['child'])) {
+			$found = &_batchreminders_find_navigation_node($node['child'], $name);
+			if ($found !== NULL) {
+				return $found;
+			}
+		}
+	}
+	$null = NULL;
+	return $null;
+}
+
+/**
+ * Hoogste navID in de hele boom, om een botsingsvrije nieuwe ID te kiezen.
+ */
+function _batchreminders_max_navigation_id(array $nodes): int {
+	$max = 0;
+	foreach ($nodes as $navId => $node) {
+		$max = max($max, (int) $navId);
+		if (isset($node['child']) && is_array($node['child'])) {
+			$max = max($max, _batchreminders_max_navigation_id($node['child']));
+		}
+	}
+	return $max;
+}
+
+/**
  * De gedeelde batchgrootte: één knop voor render-limiet én verzend-vangnet.
  * Instelbaar via Civi::settings() (settings/Batchreminders.setting.php), default 25.
  */
@@ -39,11 +124,17 @@ function _batchreminders_batchsize(): int {
  * Leiding-templates herkennen we aan het JL-segment of LEID in de titel
  * (bv. "17_JL_1WEEK_LEID_WK1") — die komen ná alle deelnemer-templates.
  *
- * @return array{leid: bool, camp: int}  camp: KK=1 BK=2 TK=3 JK=4 TOP=5, onbekend=6
+ * Niet-kamp-templates (bv. jubilea, fietshuur) krijgen bewust de HOOGSTE prioriteit
+ * (camp=0, vóór KK): het zijn meestal losse, kleine wachtrijen die anders structureel
+ * verdrongen worden door de veel grotere kamp-wachtrijen in de greedy budgetverdeling
+ * (_batchreminders_rank_and_allocate) — vastgesteld 5-jul-2026 toen 2 losse reminders
+ * (JUBILEUM, FIETS) met elk 1 wachtende nooit aan de beurt kwamen.
+ *
+ * @return array{leid: bool, camp: int}  camp: onbekend=0 KK=1 BK=2 TK=3 JK=4 TOP=5
  */
 function _batchreminders_classify_title(string $title): array {
 	$isLeid	= (bool) preg_match('/(^|_)JL(_|$)|LEID/i', $title);
-	$camp	= 6;
+	$camp	= 0;
 	// Simpele substring-match in prioriteitsvolgorde: dekt zowel losse kampen (KK1)
 	// als samengestelde reminders (KKBKTKJK → telt als KK, het hoogst geprioriteerde
 	// kamp in de set). Woordgrenzen werken hier niet door die samenstellingen.
@@ -114,8 +205,14 @@ function _batchreminders_id_to_day(int $id, array $history, string $fallback): s
  *   2. chronologie-emmer van het reminder-type: LANGSTE vooruitloop eerst
  *      (>2wkn, dan <=2wkn, dan <=2dgn) — de mailreeks is een lopend verhaal,
  *      dus een 4WEKEN-infomail gaat vóór een NA1DAG-mail, ongeacht kamp
- *   3. binnen gelijke urgentie: deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
- *   4. daarna pas de leiding-templates (binnen hun dag+urgentie-emmer)
+ *   3. binnen gelijke urgentie: eerst niet-kamp-templates (jubilea, fietshuur e.d. —
+ *      kleine losse wachtrijen, bewust vóóraan zodat ze niet verdrinken achter de
+ *      veel grotere kamp-wachtrijen) — inclusief hun leiding-varianten (bv. de
+ *      JUBILEUM_LEID-reminder), want die zijn net zo klein en los; daarna pas
+ *      deelnemer-kampvolgorde KK -> BK -> TK -> JK -> TOP
+ *   4. daarna pas de kamp-leiding-templates (binnen hun dag+urgentie-emmer) — dit
+ *      "deelnemer vóór leiding"-onderscheid geldt alleen bij een herkend kamp;
+ *      niet-kamp-templates slaan die tier over (zie punt 3)
  * Het budget wordt greedy uitgedeeld in die volgorde: het hoogst geprioriteerde
  * schedule wordt volledig bediend vóór het volgende aan de beurt komt.
  * Bijvangst van groeperen per reminder-type: batches zijn homogeen per template
@@ -127,8 +224,14 @@ function _batchreminders_id_to_day(int $id, array $history, string $fallback): s
  */
 function _batchreminders_rank_and_allocate(array $schedules, int $batchsize): array {
 	usort($schedules, function($a, $b) {
-		return [$a['day'], $a['urg'] ?? 2, (int) $a['leid'], $a['camp'], $a['id']]
-		   <=> [$b['day'], $b['urg'] ?? 2, (int) $b['leid'], $b['camp'], $b['id']];
+		// Het "deelnemer vóór leiding"-onderscheid geldt alleen binnen een herkend kamp (camp>0).
+		// Bij niet-kamp-templates (camp=0) doet leid er voor de sortering niet toe — die horen
+		// allemaal in de voorste, kleine tier, leiding-variant of niet.
+		$leidA = ($a['camp'] === 0) ? FALSE : $a['leid'];
+		$leidB = ($b['camp'] === 0) ? FALSE : $b['leid'];
+
+		return [$a['day'], $a['urg'] ?? 2, (int) $leidA, $a['camp'], $a['id']]
+		   <=> [$b['day'], $b['urg'] ?? 2, (int) $leidB, $b['camp'], $b['id']];
 	});
 
 	$alloc		= [];
@@ -353,6 +456,71 @@ function batchreminders_civicrm_alterMailParams(&$params, $context) {
 	}
 
 	Civi::log()->debug("batchreminders: Verzonden ({$sentCount}/{$batchLimit}) | Contact ID: {$contactId} | Email: {$toEmail}");
+}
+
+/**
+ * Pure detectie/strip-logica voor een mailtest.sh-restmarker in een onderwerp — géén DB,
+ * géén side-effects, dus los headless testbaar. Zelfde patroon als de sed-regex in
+ * mailtest.sh (CLEAN_SUBJ) en de REGEXP_REPLACE-vangnetten in _batchreminders_sync_templates()
+ * en cssinliner_civicrm_alterMailParams() — alle vier moeten wijzigen als dit patroon ooit
+ * verandert.
+ *
+ * @return array{changed: bool, subject: string}
+ */
+function _batchreminders_strip_test_marker(string $subject): array {
+	$after = preg_replace('/^\[[A-Z][0-9]{3}\] /', '', $subject);
+	$after = preg_replace('/ \[[0-9]{8}_[0-9]{6}\]$/', '', $after);
+	return ['changed' => $after !== $subject, 'subject' => $after];
+}
+
+/**
+ * Ontsmet msg_subject van gegeven templates INSTANT AAN DE BRON (civicrm_msg_template),
+ * i.p.v. te blokkeren of alleen de kopie in action_schedule te ontsmetten (zie
+ * _batchreminders_sync_templates() voor die tweede, defensieve laag).
+ *
+ * Waarom instant opschonen i.p.v. blokkeren: dit is geen inhoudelijke fout die een mens moet
+ * beoordelen (zoals kapotte markup/tokens) — het is een mechanisch herkenbaar restje van een
+ * afgebroken mailtest.sh-run (zie die file voor de bronfix van de vicieuze cirkel). Blokkeren
+ * zou de reminder onnodig laten hangen tot iemand het toevallig opmerkt; direct herstellen is
+ * hier veiliger én sneller dan wachten.
+ *
+ * @param  int[] $templateIds  Te controleren msg_template-ids (typisch: de huidige cluster).
+ * @return int    Aantal templates waarvan msg_subject is opgeschoond.
+ */
+function _batchreminders_clean_test_markers(array $templateIds): int {
+	if (empty($templateIds)) {
+		return 0;
+	}
+
+	$idList		= implode(',', array_map('intval', $templateIds));
+	$dao		= CRM_Core_DAO::executeQuery("
+		SELECT id, msg_title, msg_subject
+		FROM   civicrm_msg_template
+		WHERE  id IN ({$idList})
+		AND   (msg_subject REGEXP '^\\\\[[A-Z][0-9]{3}\\\\] ' OR msg_subject REGEXP ' \\\\[[0-9]{8}_[0-9]{6}\\\\]\$')
+	");
+
+	$cleaned = 0;
+	while ($dao->fetch()) {
+		$before	= (string) $dao->msg_subject;
+		$strip	= _batchreminders_strip_test_marker($before);
+		if (!$strip['changed']) {
+			continue; // false-positive uit de bredere SQL REGEXP-voorfilter
+		}
+		$after	= $strip['subject'];
+
+		CRM_Core_DAO::executeQuery("
+			UPDATE civicrm_msg_template SET msg_subject = %1 WHERE id = %2
+		", [
+			1 => [$after, 'String'],
+			2 => [(int) $dao->id, 'Integer'],
+		]);
+
+		Civi::log()->warning("batchreminders: mailtest-restmarker instant opgeschoond in msg_template {$dao->id} ({$dao->msg_title}): '{$before}' -> '{$after}'");
+		$cleaned++;
+	}
+
+	return $cleaned;
 }
 
 /**
@@ -636,12 +804,20 @@ function _batchreminders_sync_templates(array $okIds): int {
 	}
 
 	$idList	= implode(',', array_map('intval', $okIds));
+	// VANGNET tegen mailtest.sh-testmarkers (bv. "[L084] ... [20260701_231629]"): als een
+	// eerdere testrun ooit hard gekilld is vóór herstel, kan msg_subject permanent besmet
+	// blijven staan in civicrm_msg_template (zie mailtest.sh voor de bronfix). Deze sync
+	// mag zo'n restje nooit naar de live schedule-subject doorzetten — REGEXP_REPLACE
+	// strript het defensief, onafhankelijk van of de bron ooit hersteld wordt.
 	CRM_Core_DAO::executeQuery("
 		UPDATE civicrm_action_schedule AS S
 		INNER JOIN civicrm_msg_template AS M ON S.msg_template_id = M.id
 		SET    S.body_html  = M.msg_html,
 		       S.body_text  = M.msg_text,
-		       S.subject    = M.msg_subject
+		       S.subject    = TRIM(REGEXP_REPLACE(
+		                         REGEXP_REPLACE(M.msg_subject, '^\\\\[[A-Z][0-9]{3}\\\\] ', ''),
+		                         ' \\\\[[0-9]{8}_[0-9]{6}\\\\]\$', ''
+		                       ))
 		WHERE  S.msg_template_id IN ({$idList})
 		AND    S.body_html != M.msg_html
 	");
@@ -676,10 +852,19 @@ function _batchreminders_prewarm(): array {
 	}
 
 	$clusterTemplates	= _batchreminders_get_cluster();
+
+	// Instant opschonen vóór validatie: mailtest-restmarkers zijn geen inhoudelijke fout die
+	// blokkade + mens-review verdient (zie _batchreminders_clean_test_markers()).
+	$markersOpgeschoond	= _batchreminders_clean_test_markers(array_keys($clusterTemplates));
+	if ($markersOpgeschoond > 0 && function_exists('wachthond')) {
+		wachthond($extdebug, 1, "### {$markersOpgeschoond} MAILTEST-RESTMARKER(S) INSTANT OPGESCHOOND", "[ZELFHERSTEL]");
+	}
+
 	$startup			= _batchreminders_startup($clusterTemplates, $templateScriptDir);
 
 	if (function_exists('wachthond')) {
 		wachthond($extdebug, 3, 'cluster_templates', $clusterTemplates);
+		wachthond($extdebug, 3, 'markers_opgeschoond', $markersOpgeschoond);
 		wachthond($extdebug, 3, 'startup_result',    $startup);
 	}
 
